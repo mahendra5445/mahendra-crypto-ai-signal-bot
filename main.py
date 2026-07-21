@@ -53,10 +53,10 @@ async def post_init(application: Application) -> None:
     # warning hai). Isse auto-signal/monitor kuch ghanton baad chupchaap
     # band ho sakta tha bina kisi error ke.
     application.bot_data["_bg_tasks"] = [
-        asyncio.create_task(auto_signal_job(application), name="auto_signal"),
-        asyncio.create_task(trade_monitor_job(application), name="trade_monitor"),
-        asyncio.create_task(watchdog_job(application), name="watchdog"),
-        asyncio.create_task(daily_summary_job(application), name="daily_summary"),
+        asyncio.create_task(auto_signal_job(application), name="auto_signal_job"),
+        asyncio.create_task(trade_monitor_job(application), name="trade_monitor_job"),
+        asyncio.create_task(watchdog_job(application), name="watchdog_job"),
+        asyncio.create_task(daily_summary_job(application), name="daily_summary_job"),
     ]
     logger.info("[INIT] Background tasks started")
 
