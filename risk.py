@@ -65,10 +65,16 @@ def calculate_trade(signal, price, atr, decimals=2, session_active=True):
     if risk < min_risk:
         risk = min_risk
 
-    # Reward multiples of risk -> TP1 = 2.5R, TP2 = 4R, TP3 = 6R (runner target)
-    tp1_reward = risk * 2.5
-    tp2_reward = risk * 4.0
-    tp3_reward = risk * 6.0
+    # BUG FIX: TP1 pehle 2.5R par tha, TP3 6R par. 1-minute crypto signals
+    # par ye rakhna hi mushkil hai -- random walk par bhi 2.5R se pehle 1R
+    # lagne ka chance ~71% hota hai, yaani design se hi 4 mein se 3 trade
+    # haarne the. Aur status "TP" sirf TP3 (6R!) par set hota tha, jo
+    # lagbhag kabhi aata hi nahi.
+    # Ab TP1 = 1.2R (pehla partial jaldi lagta hai aur SL breakeven par
+    # chala jaata hai), TP2 = 2R, TP3 = 3R.
+    tp1_reward = risk * 1.2
+    tp2_reward = risk * 2.0
+    tp3_reward = risk * 3.0
 
     if signal == "BUY":
         sl = round(entry - risk, decimals)

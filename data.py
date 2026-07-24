@@ -360,3 +360,39 @@ def get_candles(asset: str = "btc") -> dict:
             "15m": tf15["close"],
         },
     }
+
+
+def get_recent_range(asset: str = "btc", bars: int = 3) -> dict | None:
+    """
+    Last `bars` 1-minute candles ka HIGH / LOW / last CLOSE.
+
+    KYUN: trade_monitor pehle get_latest_price() use karta tha, jo aakhri 5
+    one-minute CLOSES ka MEDIAN deta hai. Wo do wajah se wins ko chupa
+    raha tha:
+      1. Median jaan-boojh kar spikes ko smooth kar deta hai -- aur TP
+         aksar spike par hi hit hota hai.
+      2. Monitor har 120s par ek hi number dekhta tha. Do poll ke beech
+         TP touch ho kar wapas aa jaye to wo poori tarah invisible tha.
+    SL ke saath ye problem nahi hoti: price SL ke paar jaake wahin rehta
+    hai, to agla poll use pakad hi leta hai. Isliye SL hamesha register
+    hota tha aur TP aksar nahi -- win rate artificially 5% tak gir gaya.
+
+    High/low use karne se dono taraf ek jaisa insaaf hota hai.
+    """
+    try:
+        tf = get_asset_tf(asset, "1min")
+    except Exception:
+        return None
+
+    highs = [h for h in (tf.get("high") or []) if h is not None][-bars:]
+    lows  = [l for l in (tf.get("low")  or []) if l is not None][-bars:]
+    closes = [c for c in (tf.get("close") or []) if c is not None]
+
+    if not highs or not lows or not closes:
+        return None
+
+    return {
+        "high":  float(max(highs)),
+        "low":   float(min(lows)),
+        "close": float(closes[-1]),
+    }

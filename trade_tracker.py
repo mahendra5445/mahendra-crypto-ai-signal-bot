@@ -186,7 +186,14 @@ def get_stats(asset: str | None = None, since: str | None = None) -> dict:
     be   = sum(1 for t in trades if t["status"] == "BE")
 
     closed   = tp + sl + be
-    win_rate = round((tp / closed) * 100, 2) if closed > 0 else 0.0
+    # BUG FIX: status "TP" sirf TP3 (full 3R target) par set hota hai.
+    # Jo trade TP1 hit karke breakeven par band hua wo PROFIT mein tha,
+    # par win rate use haar gin raha tha -- isliye 84 signals par win rate
+    # 5.41% dikh raha tha jabki 11 "breakeven" trades asal mein jeete the.
+    # Ab TP1 tak pahunchne wala har trade win hai.
+    wins = sum(1 for t in trades
+               if t["status"] == "TP" or t.get("hit_tp1"))
+    win_rate = round((wins / closed) * 100, 2) if closed > 0 else 0.0
 
     return {
         "total":    buy + sell,
@@ -195,6 +202,7 @@ def get_stats(asset: str | None = None, since: str | None = None) -> dict:
         "tp":       tp,
         "sl":       sl,
         "be":       be,
+        "wins": wins,
         "win_rate": win_rate,
     }
 

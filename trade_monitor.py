@@ -13,7 +13,7 @@ import asyncio
 import logging
 
 from config import ASSETS
-from data import get_latest_price
+from data import get_recent_range
 from notify import notify_channel
 from shared_state import trade_lock
 from trade_tracker import (
@@ -25,7 +25,8 @@ from trade_tracker import (
 
 logger = logging.getLogger(__name__)
 
-CHECK_INTERVAL = 120   # seconds — check every 2 min for responsive TP tracking
+CHECK_INTERVAL = 60    # seconds. 60s poll + last-3-bars lookback = overlap,
+                       # so no minute can slip between two checks unseen.
 
 
 # ── helpers ───────────────────────────────────────────────────────────────
@@ -42,7 +43,7 @@ SL_BUFFER_PCT = 0.0003   # 0.03% of price — small margin beyond SL required
                           # close on a price that immediately reverts.
 
 
-def _compute_events(trade: dict, price: float) -> list[str]:
+def _compute_events(trade: dict, high: float, low: float) -> list[str]:
     """
     Returns a list of event strings that have just been triggered at
     this price, in priority order (SL/BE first, then TP1→TP2→TP3).
@@ -60,10 +61,14 @@ def _compute_events(trade: dict, price: float) -> list[str]:
     # clear the SL by a small buffer filters that out without meaningfully
     # widening the real stop (it's ~0.03% of price, far smaller than the
     # ATR-based SL distance itself).
+    # BUY ke liye khilaaf ka extreme = LOW, favour ka = HIGH. SELL ulta.
+    adverse    = low  if is_buy else high
+    favourable = high if is_buy else low
+
     sl_buffer = trade["sl"] * SL_BUFFER_PCT
     sl_hit = (
-        (is_buy     and price <= trade["sl"] - sl_buffer) or
-        (not is_buy and price >= trade["sl"] + sl_buffer)
+        (is_buy     and adverse <= trade["sl"] - sl_buffer) or
+        (not is_buy and adverse >= trade["sl"] + sl_buffer)
     )
     if sl_hit:
         # If TP1 was already hit, SL at entry = breakeven close
@@ -72,15 +77,15 @@ def _compute_events(trade: dict, price: float) -> list[str]:
 
     # ── Take Profits ──────────────────────────────────────────────────────
     if not trade["hit_tp1"]:
-        if (is_buy and price >= trade["tp1"]) or (not is_buy and price <= trade["tp1"]):
+        if (is_buy and favourable >= trade["tp1"]) or (not is_buy and favourable <= trade["tp1"]):
             events.append("tp1")
 
     if not trade["hit_tp2"]:
-        if (is_buy and price >= trade["tp2"]) or (not is_buy and price <= trade["tp2"]):
+        if (is_buy and favourable >= trade["tp2"]) or (not is_buy and favourable <= trade["tp2"]):
             events.append("tp2")
 
     if not trade["hit_tp3"]:
-        if (is_buy and price >= trade["tp3"]) or (not is_buy and price <= trade["tp3"]):
+        if (is_buy and favourable >= trade["tp3"]) or (not is_buy and favourable <= trade["tp3"]):
             events.append("tp3")
 
     return events
@@ -88,12 +93,12 @@ def _compute_events(trade: dict, price: float) -> list[str]:
 
 # ── per-trade check ───────────────────────────────────────────────────────
 
-async def _check_trade(application, trade: dict, price: float) -> None:
+async def _check_trade(application, trade: dict, bar: dict) -> None:
     notifications: list[str] = []
     trade_closed = False
 
     decimals = ASSETS.get(trade["asset"].lower(), {}).get("decimals", 2)
-    price_display = round(price, decimals)
+    price_display = round(bar["close"], decimals)
 
     # ── Critical section: mutate state atomically ─────────────────────────
     async with trade_lock:
@@ -108,7 +113,7 @@ async def _check_trade(application, trade: dict, price: float) -> None:
         # kiya "sl" event ab bhi purane SL pe fire karke trade ko galat
         # "SL Hit" mark kar deta. Ab events lock ke andar fresh state se
         # compute hote hain.
-        events = _compute_events(trade, price)
+        events = _compute_events(trade, bar["high"], bar["low"])
         if not events:
             return
 
@@ -201,10 +206,10 @@ async def trade_monitor_job(application) -> None:
                 # every OTHER open trade this cycle too, not just the
                 # failing asset.
                 fetched = await asyncio.gather(
-                    *(asyncio.to_thread(get_latest_price, a) for a in asset_list),
+                    *(asyncio.to_thread(get_recent_range, a) for a in asset_list),
                     return_exceptions=True,
                 )
-                prices: dict[str, float | None] = {}
+                prices: dict[str, dict | None] = {}
                 for a, result in zip(asset_list, fetched):
                     if isinstance(result, Exception):
                         logger.error(f"[MONITOR] Price fetch failed for {a.upper()}: {result}")
@@ -214,13 +219,13 @@ async def trade_monitor_job(application) -> None:
 
                 # Iterate over a snapshot copy so mutations don't affect the loop
                 for trade in list(open_trades):
-                    price = prices.get(trade["asset"])
-                    if price is None:
+                    bar = prices.get(trade["asset"])
+                    if bar is None:
                         logger.warning(
                             f"[MONITOR] No price for {trade['asset'].upper()} — skipping"
                         )
                         continue
-                    await _check_trade(application, trade, price)
+                    await _check_trade(application, trade, bar)
 
         except Exception as e:
             logger.error(f"[MONITOR ERROR] {e}")
