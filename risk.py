@@ -1,96 +1,75 @@
+"""
+Risk model: ATR-based stop, targets built off the risk distance so the
+posted risk-reward is always the real one.
+"""
+
 import math
+
+from config import MIN_RISK_PCT
+
+# Targets as multiples of the risk distance (R).
+TP1_R = 1.2
+TP2_R = 2.0
+TP3_R = 3.0
+
+ATR_MULT = 2.5          # stop = 2.5 x ATR(5m)
+ASIAN_WIDEN = 1.4       # widen stop + floor by 40% in thin sessions
 
 
 def calculate_trade(signal, price, atr, decimals=2, session_active=True):
     """
-    Smart Risk Management
-    - ATR based Stop Loss
-    - TP1, TP2, TP3 built off the risk distance so Risk:Reward
-      is always at least 1:2
+    `decimals` MUST come from config.effective_decimals(asset, price) —
+    a hardcoded per-coin value silently destroys the risk model on
+    low-priced coins (a $6 coin at 2 decimals gets a one-cent stop, so a
+    1.2R target rounds to exactly 1.0R).
 
-    `decimals` controls rounding precision — gold/BTC/oil use 2, but a pair
-    like EUR/USD needs 4-5 decimals or a 0.01 rounding would erase ~100 pips
-    of precision. Defaults to 2 for backward compatibility with old callers.
-
-    `session_active` — True for London/New York, False for Asian/Off-Hours
-    (see session.py). Passed through so the SL can be widened below.
+    `session_active` — True for London/New York, False for Asian/Off-Hours.
+    Thin sessions get a wider stop: same ATR, wider real spread and noisier
+    wicks, so a stop sized for London liquidity gets tagged by noise alone.
     """
 
-    if signal not in ["BUY", "SELL"]:
+    if signal not in ("BUY", "SELL"):
         return {
-            "entry": None,
-            "sl": None,
-            "tp1": None,
-            "tp2": None,
-            "tp3": None,
-            "risk_reward": "-"
+            "entry": None, "sl": None, "tp1": None, "tp2": None, "tp3": None,
+            "risk_distance": None, "risk_reward": "-",
         }
 
     entry = round(price, decimals)
 
-    # BUG FIX: SL was only 1.5x ATR(5m). On gold that's often just $1-2,
-    # which sits inside normal broker spread + tick noise, so trades were
-    # getting stopped out almost immediately even when direction was
-    # right (this is why SL Hit was far higher than TP Hit / win rate
-    # was ~0%). Widened to 2.5x ATR — a more realistic scalping stop.
-    #
-    # BUG FIX (SL hitting too early during Asian/low-liquidity session):
-    # strategy.py stopped hard-blocking Asian-session trades (session_ok is
-    # now info-only), but this function still used the exact same SL
-    # distance for every session. Asian/off-hours session = thinner order
-    # books = wider real broker spread + more noisy wicks relative to the
-    # same ATR reading, so a stop sized for London/NY liquidity gets tagged
-    # by spread/noise alone, not a genuine move against you. When
-    # session_active is False we widen both the ATR multiplier and the
-    # minimum floor by 40%.
-    session_factor = 1.0 if session_active else 1.4
-    sl_mult = 2.5 * session_factor
+    session_factor = 1.0 if session_active else ASIAN_WIDEN
+    sl_mult = ATR_MULT * session_factor
 
-    # atr can come through as NaN if upstream data had a gap - guard that
-    # explicitly since `nan <= 0` is False in Python, so the old
-    # "risk <= 0" fallback below would silently let NaN through and turn
-    # every SL/TP into "nan" in the Telegram message.
+    # ATR arrives as NaN if upstream data had a gap. `nan <= 0` is False in
+    # Python, so an unguarded NaN would flow straight through and turn every
+    # SL/TP in the Telegram message into "nan".
     if atr is None or (isinstance(atr, float) and math.isnan(atr)):
         atr = 0
 
     risk = round(atr * sl_mult, decimals)
 
-    # BUG FIX: minimum SL floor. Previously the price*0.001 fallback only
-    # kicked in when risk was <= 0. In quiet markets ATR could still
-    # produce a small positive risk (e.g. ~$1) that slipped straight
-    # through spread/noise and got stopped out instantly. Now we always
-    # enforce a floor of 0.15% of price (0.21% during Asian/off-hours),
-    # regardless of how small ATR is.
-    min_risk = round(price * 0.0015 * session_factor, decimals)
+    # Floor the stop at MIN_RISK_PCT of price so a quiet market can't produce
+    # a stop that sits inside normal spread and noise.
+    min_risk = round(price * MIN_RISK_PCT * session_factor, decimals)
     if risk < min_risk:
         risk = min_risk
 
-    # BUG FIX: TP1 pehle 2.5R par tha, TP3 6R par. 1-minute crypto signals
-    # par ye rakhna hi mushkil hai -- random walk par bhi 2.5R se pehle 1R
-    # lagne ka chance ~71% hota hai, yaani design se hi 4 mein se 3 trade
-    # haarne the. Aur status "TP" sirf TP3 (6R!) par set hota tha, jo
-    # lagbhag kabhi aata hi nahi.
-    # Ab TP1 = 1.2R (pehla partial jaldi lagta hai aur SL breakeven par
-    # chala jaata hai), TP2 = 2R, TP3 = 3R.
-    tp1_reward = risk * 1.2
-    tp2_reward = risk * 2.0
-    tp3_reward = risk * 3.0
+    tp1_reward = risk * TP1_R
+    tp2_reward = risk * TP2_R
+    tp3_reward = risk * TP3_R
 
     if signal == "BUY":
-        sl = round(entry - risk, decimals)
+        sl  = round(entry - risk, decimals)
         tp1 = round(entry + tp1_reward, decimals)
         tp2 = round(entry + tp2_reward, decimals)
         tp3 = round(entry + tp3_reward, decimals)
-
-    else:  # SELL
-        sl = round(entry + risk, decimals)
+    else:
+        sl  = round(entry + risk, decimals)
         tp1 = round(entry - tp1_reward, decimals)
         tp2 = round(entry - tp2_reward, decimals)
         tp3 = round(entry - tp3_reward, decimals)
 
-    actual_risk = abs(entry - sl)
+    actual_risk   = abs(entry - sl)
     actual_reward = abs(tp1 - entry)
-
     rr = round(actual_reward / actual_risk, 2) if actual_risk > 0 else 0
 
     return {
@@ -99,5 +78,6 @@ def calculate_trade(signal, price, atr, decimals=2, session_active=True):
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "risk_reward": f"1:{rr}"
+        "risk_distance": actual_risk,
+        "risk_reward": f"1:{rr}",
     }

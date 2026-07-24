@@ -1,31 +1,25 @@
 """
-Trade Tracker — single source of truth for all trade state.
+Trade Tracker — the single source of truth for all trade state.
 
-Fixes applied:
-  #1  Duplicate trade save     — save_trade() is idempotent; caller must hold
-                                  trade_lock before calling it.
-  #2  Open trade lock          — has_open_trade(asset) lets callers check before
-                                  creating a new trade.
-  #3  Trade persistence        — every mutation calls _persist() → atomic JSON write.
-  #4  TP1/BE persistence       — mark_tp1_hit() / mark_tp2_hit() persist immediately.
-  #5  Duplicate trade ID       — persisted next_id counter, never resets or repeats
-                                  even after history cleanup.
-  #6  Stats accuracy           — get_stats() is always derived from the live trade
-                                  list; no separate counters that can drift.
- #15/#16 History cleanup/limit — _trim_history() keeps ≤ MAX_TRADE_HISTORY trades;
-                                  open trades are never evicted.
+Every trade now records enough to be audited after the fact:
+  opened_ts   unix timestamp of entry — the trade monitor uses this to
+              ignore bars that predate the trade (see trade_monitor.py)
+  original_sl the stop as it was at entry. mark_tp1_hit() moves `sl` to
+              breakeven, which used to DESTROY the only record of the real
+              risk distance, making every R-multiple in the stats fiction.
+  exit_price / closed_ts  what actually closed the trade, and when.
 """
 
 import logging
+import time
 from datetime import datetime
 
 from persistence import load_trades_from_disk, save_trades_to_disk
 
 logger = logging.getLogger(__name__)
 
-MAX_TRADE_HISTORY = 500   # maximum trades kept in memory / on disk
+MAX_TRADE_HISTORY = 500
 
-# ── module-level state (loaded once at import time) ──────────────────────
 _trades: list[dict]
 _next_id: int
 _trades, _next_id = load_trades_from_disk()
@@ -38,10 +32,7 @@ def _persist() -> None:
 
 
 def _trim_history() -> None:
-    """
-    Evict old *closed* trades when the list exceeds MAX_TRADE_HISTORY.
-    Open trades are never evicted — they must be monitored until settled.
-    """
+    """Evict old CLOSED trades past the cap. Open trades are never evicted."""
     global _trades
     if len(_trades) <= MAX_TRADE_HISTORY:
         return
@@ -62,8 +53,12 @@ def _trim_history() -> None:
 
 # ── public API ────────────────────────────────────────────────────────────
 
+def all_trades() -> list[dict]:
+    """Read-only view for analytics/guards."""
+    return list(_trades)
+
+
 def has_open_trade(asset: str) -> bool:
-    """True when the asset already has at least one OPEN trade."""
     a = asset.lower()
     return any(t["status"] == "OPEN" and t["asset"].lower() == a for t in _trades)
 
@@ -71,8 +66,7 @@ def has_open_trade(asset: str) -> bool:
 def save_trade(result: dict, asset: str = "btc") -> dict | None:
     """
     Persist a new trade from a signal result dict.
-    Caller MUST hold shared_state.trade_lock before calling this.
-    Returns the new trade dict, or None if signal is not BUY/SELL.
+    Caller MUST hold shared_state.trade_lock.
     """
     global _next_id
 
@@ -80,20 +74,28 @@ def save_trade(result: dict, asset: str = "btc") -> dict | None:
     if signal not in ("BUY", "SELL"):
         return None
 
+    now = time.time()
+    entry = float(result["entry"])
+    sl    = float(result["sl"])
+
     trade = {
-        "id":       _next_id,
-        "asset":    asset.lower(),
-        "signal":   signal,
-        "entry":    round(float(result["entry"]), 5),
-        "sl":       round(float(result["sl"]),    5),
-        "tp1":      round(float(result["tp1"]),   5),
-        "tp2":      round(float(result["tp2"]),   5),
-        "tp3":      round(float(result["tp3"]),   5),
-        "hit_tp1":  False,
-        "hit_tp2":  False,
-        "hit_tp3":  False,
-        "status":   "OPEN",
-        "time":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "id":          _next_id,
+        "asset":       asset.lower(),
+        "signal":      signal,
+        "entry":       round(entry, 8),
+        "sl":          round(sl, 8),
+        "original_sl": round(sl, 8),
+        "tp1":         round(float(result["tp1"]), 8),
+        "tp2":         round(float(result["tp2"]), 8),
+        "tp3":         round(float(result["tp3"]), 8),
+        "hit_tp1":     False,
+        "hit_tp2":     False,
+        "hit_tp3":     False,
+        "status":      "OPEN",
+        "opened_ts":   now,
+        "closed_ts":   None,
+        "exit_price":  None,
+        "time":        datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
     }
 
     _next_id += 1
@@ -112,11 +114,10 @@ def get_open_trades() -> list[dict]:
     return [t for t in _trades if t["status"] == "OPEN"]
 
 
-def update_trade(trade_id: int, status: str) -> bool:
+def update_trade(trade_id: int, status: str, exit_price: float | None = None) -> bool:
     """
     Close a trade with a final status (TP / SL / BE).
     Caller MUST hold shared_state.trade_lock.
-    Returns True on success, False if trade was not found or already closed.
     """
     for trade in _trades:
         if trade["id"] != trade_id:
@@ -127,7 +128,9 @@ def update_trade(trade_id: int, status: str) -> bool:
                 f"ignoring request to set '{status}'"
             )
             return False
-        trade["status"] = status
+        trade["status"]     = status
+        trade["closed_ts"]  = time.time()
+        trade["exit_price"] = round(float(exit_price), 8) if exit_price is not None else None
         _persist()
         logger.info(f"[TRADE] #{trade_id} closed as {status}")
         return True
@@ -138,17 +141,21 @@ def update_trade(trade_id: int, status: str) -> bool:
 
 def mark_tp1_hit(trade: dict) -> None:
     """
-    Mark TP1 as hit and move SL to breakeven.
-    Persists immediately.  Caller must hold trade_lock.
+    Mark TP1 as hit and move the stop to breakeven.
+
+    BUG FIX: this used to overwrite `sl` with the entry price and keep no
+    record of the real stop. Every later R-multiple, and every "SL" line in
+    /history, then showed the breakeven price as if it had been the original
+    risk. `original_sl` is now preserved.
     """
     trade["hit_tp1"] = True
-    trade["sl"]      = trade["entry"]
+    trade.setdefault("original_sl", trade["sl"])
+    trade["sl"] = trade["entry"]
     _persist()
     logger.info(f"[TRADE] #{trade['id']} TP1 hit — SL moved to breakeven")
 
 
 def mark_tp2_hit(trade: dict) -> None:
-    """Mark TP2 as hit.  Persists immediately.  Caller must hold trade_lock."""
     trade["hit_tp2"] = True
     _persist()
     logger.info(f"[TRADE] #{trade['id']} TP2 hit")
@@ -161,57 +168,64 @@ def find_trade(trade_id: int) -> dict | None:
     return None
 
 
-def get_stats(asset: str | None = None, since: str | None = None) -> dict:
-    """
-    Stats derived live from the trade list — never drifts out of sync
-    regardless of restarts, cleanups, or any edge case.
-
-    asset — optional, filter to a single asset's trades (e.g. "eurusd").
-    since — optional, "YYYY-MM-DD" — only trades opened on/after this date
-            (trade["time"] is "YYYY-MM-DD HH:MM:SS", so a plain string
-            comparison works). Used for daily summaries.
-    No args = old behaviour, combined across every asset, all-time.
-    """
+def _filtered(asset: str | None = None, since: str | None = None) -> list[dict]:
     trades = _trades
     if asset:
         a = asset.lower()
         trades = [t for t in trades if t["asset"].lower() == a]
     if since:
         trades = [t for t in trades if t["time"] >= since]
+    return trades
+
+
+def get_stats(asset: str | None = None, since: str | None = None) -> dict:
+    """
+    Stats derived live from the trade list, so they can never drift out of
+    sync with reality after a restart or a history trim.
+
+    BUG FIX: `wins` used to count any trade whose TP1 had been hit —
+    including trades that were still OPEN — while `closed` counted only
+    settled trades. A day with two running winners and one loss reported a
+    win rate of 200%. Wins are now counted from CLOSED trades only.
+
+    What counts as a win: TP3 (full target), and BE — because a breakeven
+    close can only happen AFTER TP1 was hit, i.e. the first partial was
+    already banked. A stop with no TP1 is the only loss.
+    """
+    trades = _filtered(asset, since)
 
     buy  = sum(1 for t in trades if t["signal"] == "BUY")
     sell = sum(1 for t in trades if t["signal"] == "SELL")
-    tp   = sum(1 for t in trades if t["status"] == "TP")
-    sl   = sum(1 for t in trades if t["status"] == "SL")
-    be   = sum(1 for t in trades if t["status"] == "BE")
 
-    closed   = tp + sl + be
-    # BUG FIX: status "TP" sirf TP3 (full 3R target) par set hota hai.
-    # Jo trade TP1 hit karke breakeven par band hua wo PROFIT mein tha,
-    # par win rate use haar gin raha tha -- isliye 84 signals par win rate
-    # 5.41% dikh raha tha jabki 11 "breakeven" trades asal mein jeete the.
-    # Ab TP1 tak pahunchne wala har trade win hai.
-    wins = sum(1 for t in trades
-               if t["status"] == "TP" or t.get("hit_tp1"))
-    win_rate = round((wins / closed) * 100, 2) if closed > 0 else 0.0
+    closed_trades = [t for t in trades if t["status"] != "OPEN"]
+    tp   = sum(1 for t in closed_trades if t["status"] == "TP")
+    sl   = sum(1 for t in closed_trades if t["status"] == "SL")
+    be   = sum(1 for t in closed_trades if t["status"] == "BE")
+    closed = len(closed_trades)
+
+    wins   = sum(1 for t in closed_trades
+                 if t["status"] == "TP" or (t["status"] == "BE" and t.get("hit_tp1")))
+    losses = closed - wins
+
+    win_rate = round((wins / closed) * 100, 2) if closed else 0.0
 
     return {
         "total":    buy + sell,
         "buy":      buy,
         "sell":     sell,
+        "open":     sum(1 for t in trades if t["status"] == "OPEN"),
+        "closed":   closed,
         "tp":       tp,
         "sl":       sl,
         "be":       be,
-        "wins": wins,
+        "wins":     wins,
+        "losses":   losses,
         "win_rate": win_rate,
     }
 
 
 def get_last_trades(limit: int = 10, asset: str | None = None) -> list[dict]:
-    trades = _trades
-    if asset:
-        a = asset.lower()
-        trades = [t for t in trades if t["asset"].lower() == a]
+    trades = _filtered(asset)
     return list(reversed(trades[-limit:]))
 
 
@@ -225,15 +239,33 @@ def history_text(limit: int = 10, asset: str | None = None) -> str:
 
     for trade in trades:
         icon = status_icon.get(trade["status"], "❓")
+        orig = trade.get("original_sl", trade["sl"])
+
+        # BUG FIX: once TP1 was hit the stop shows the entry price, which made
+        # /history look like a "SL == Entry" bug. Label it for what it is.
+        if trade.get("hit_tp1") and trade["sl"] == trade["entry"]:
+            sl_line = f"{trade['sl']}  (moved to BE, original {orig})"
+        else:
+            sl_line = f"{trade['sl']}"
+
+        progress = ""
+        if trade["hit_tp3"]:
+            progress = "TP1 ✅ TP2 ✅ TP3 ✅"
+        elif trade["hit_tp2"]:
+            progress = "TP1 ✅ TP2 ✅"
+        elif trade["hit_tp1"]:
+            progress = "TP1 ✅"
+
         lines.append(
             f"#{trade['id']} | {trade['asset'].upper()} | "
             f"{trade['signal']} {icon}\n"
             f"Entry  : {trade['entry']}\n"
-            f"SL     : {trade['sl']}\n"
+            f"SL     : {sl_line}\n"
             f"TP1    : {trade['tp1']}\n"
             f"TP2    : {trade['tp2']}\n"
             f"TP3    : {trade['tp3']}\n"
-            f"Status : {trade['status']}\n"
+            f"Status : {trade['status']}"
+            + (f"  ({progress})" if progress else "") + "\n"
             f"{trade['time']}\n"
         )
 

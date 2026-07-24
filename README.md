@@ -1,135 +1,224 @@
-# Mahendra Crypto AI Signal
+# Mahendra Crypto AI Signal Bot
 
-Telegram bot jo 12 high-liquidity crypto coins — BTC, ETH, SOL, XRP, BNB,
-DOGE, ADA, LINK, AVAX, TON, SUI, LTC — ke liye AI-scored trading signals
-deta hai, technical indicators, multi-timeframe trend, smart-money
-concepts (BOS/CHoCH/liquidity), aur candlestick patterns ko combine
-karke, aur **seedha ek Telegram channel mein post karta hai**
-(individual users ko `/start` karne ki zaroorat nahi).
+Telegram signal bot for 12 crypto pairs. Scans each asset on a fixed cycle,
+posts qualifying setups to a channel, then tracks every trade to SL / TP1 /
+TP2 / TP3 and reports real performance.
 
-## Original bot se kya different hai
+**Every number this bot prints comes from the live trade list.** There are no
+hand-maintained counters, and no claimed win rates anywhere in this repo.
 
-Ye gold-ai-telegram-bot ka clone hai. Sab signal-scoring engine,
-risk/SL/TP logic, aur background jobs same hain — do cheezein badli hain:
+---
 
-1. **Assets** — Gold/BTC/Oil/EUR-USD/USD-JPY/LINK/ATOM ki jagah ab 12
-   crypto coins hain (upar list dekho).
-2. **Delivery** — har registered user ko alag-alag message bhejne ki
-   jagah, sab signals ek fixed Telegram **channel** (`CHANNEL_ID`) mein
-   post hote hain — bot us channel ka admin hona chahiye ("Post
-   Messages" permission ke saath).
+## Quick start
 
-## Kaise kaam karta hai
+```bash
+pip install -r requirements.txt
 
-- Har **15 minute** mein bot saare configured coins (`config.py` →
-  `ASSET_LIST`) ka data check karta hai (`auto_signal.py`).
-- Signal 12 confirmation checks (EMA, ADX, Supertrend, VWAP, MACD,
-  RSI, multi-timeframe trend, volume, ATR, liquidity, volume spike,
-  candle confirmation) ke against score hota hai — sirf tab fire
-  hota hai jab score aur confirmations dono threshold cross karein
-  (`strategy.py` → `MIN_SCORE`, `MIN_CONFIRMATIONS`).
-- Ek signal ke baad us coin ke liye **15-minute cooldown** lagta hai
-  aur jab tak purana trade close nahi hota, naya signal nahi aata
-  (ek time pe ek open trade per coin).
-- Entry/SL/TP ATR-based hain (`risk.py`) — SL = 2.0× ATR, TP1/TP2/TP3
-  = 2.5R / 4R / 6R. Har coin ka display/rounding precision uske
-  `decimals` config se control hota hai — chhote-price coins (jaise
-  XRP, DOGE) ke liye ye precision zaroori hai warna signal levels
-  galat round ho jaate hain.
-- Open trades `trade_monitor.py` har 2 minute mein price check karke
-  track karta hai (SL / breakeven / TP1 / TP2 / TP3 hits) aur channel
-  mein update post karta hai.
-- `watchdog.py` har 5 minute mein check karta hai ki auto-signal loop
-  zinda hai ya nahi (agar 40+ minute se koi cycle complete na hui ho,
-  matlab kahin stuck/silently failed hai, to channel mein alert bhejta
-  hai).
-- `daily_summary.py` roz ek fixed time pe (default 18:00 server-local)
-  us din ka combined + per-coin signal count aur win rate channel mein
-  post karta hai.
-- Sab trades `data/trades.json` mein persist hote hain (atomic
-  writes).
+export BOT_TOKEN="123456:ABC..."        # from @BotFather
+export CHANNEL_ID="@yourchannel"        # bot must be admin with Post Messages
+export DATABASE_URL="postgresql://..."  # optional but strongly recommended
 
-## Assets
+python main.py
+python test_fixes.py                    # regression suite, no network needed
+```
 
-| Coin | Command | Yahoo Symbol | Binance Symbol | Decimals |
-|------|---------|-------------|-----------------|----------|
-| Bitcoin | `/btc` | `BTC-USD` | `BTCUSDT` | 2 |
-| Ethereum | `/eth` | `ETH-USD` | `ETHUSDT` | 2 |
-| Solana | `/sol` | `SOL-USD` | `SOLUSDT` | 2 |
-| XRP | `/xrp` | `XRP-USD` | `XRPUSDT` | 4 |
-| BNB | `/bnb` | `BNB-USD` | `BNBUSDT` | 2 |
-| Dogecoin | `/doge` | `DOGE-USD` | `DOGEUSDT` | 5 |
-| Cardano | `/ada` | `ADA-USD` | `ADAUSDT` | 4 |
-| Chainlink | `/link` | `LINK-USD` | `LINKUSDT` | 4 |
-| Avalanche | `/avax` | `AVAX-USD` | `AVAXUSDT` | 2 |
-| Toncoin | `/ton` | `TON-USD` | `TONUSDT` | 3 |
-| Sui | `/sui` | `SUI-USD` | `SUIUSDT` | 4 |
-| Litecoin | `/ltc` | `LTC-USD` | `LTCUSDT` | 2 |
+## Railway deployment
 
-Naya coin add karna ho to bas `config.py` → `ASSETS` dict mein ek
-entry add karo — baaki sab code (`data.py`, `main.py`,
-`auto_signal.py`) generic hai aur apne aap naya coin pick kar leta hai.
+1. Connect the GitHub repo — `railway.toml` handles the build.
+2. **Add the Postgres plugin.** Railway then sets `DATABASE_URL` for you.
+   Without it the bot writes to the container filesystem, which is wiped on
+   every deploy: open trades are orphaned and all history resets to zero.
+   The startup log tells you which backend is live.
+3. Set `BOT_TOKEN` and `CHANNEL_ID` in Variables.
+
+Confirm it worked: restart the service, then send `/history` — the trades
+should still be there.
+
+---
 
 ## Commands
 
-Ye commands bot ko **DM** mein bheje jaate hain (channel mein nahi) —
-manual check ke liye, jaise ki testing:
+| Command | What it does |
+|---|---|
+| `/btc` `/eth` `/sol` … | Manual signal for that asset |
+| `/signal` | Same as `/btc` |
+| `/trend` | Multi-timeframe trend summary |
+| `/stats [asset]` | Signal counts, TP/SL/BE breakdown, win rate |
+| `/perf [asset]` | Expectancy, profit factor, drawdown, streaks — in R |
+| `/guards` | Exposure, daily count, loss streak, pause state |
+| `/history [asset]` | Last 10 trades with TP progress |
 
-| Command    | Kaam |
-|------------|------|
-| `/start`   | Bot online hai ya nahi confirm karo, command list dekho |
-| `/btc`, `/eth`, `/sol`, `/xrp`, `/bnb`, `/doge`, `/ada`, `/link`, `/avax`, `/ton`, `/sui`, `/ltc` | Manual signal check us coin ka |
-| `/signal`  | `/btc` jaisa hi |
-| `/trend`   | 1M/5M/15M trend summary (BTC) |
-| `/stats`   | Trade statistics (add coin name for one coin, e.g. `/stats sol`; no arg = combined + per-coin breakdown) |
-| `/history` | Last 10 trades (add coin name to filter, e.g. `/history eth`) |
+---
 
-**Auto-signals, trade updates, watchdog alerts, aur daily summary**
-sab automatically channel mein post hote hain — koi command nahi
-chahiye.
+## How a trade is tracked
 
-## Setup
+1. `strategy.py` scores the setup; only BUY/SELL setups continue.
+2. Levels are re-priced off a near-live quote so the posted entry is not a
+   stale 5-minute candle close.
+3. `guards.py` decides whether the trade is allowed to open at all.
+4. `trade_monitor.py` polls 1-minute bars every 60s and **replays them in
+   chronological order, starting from the bar after entry.**
+5. TP1 banks the first partial and moves the stop to breakeven —
+   `original_sl` is kept so the R maths stays honest.
 
-1. `pip install -r requirements.txt`
-2. `.env.example` ko `.env` bana lo aur fill karo:
-   - `BOT_TOKEN` — @BotFather se milega
-   - `CHANNEL_ID` — jis channel mein post karna hai, uska `@username`
-     (public) ya numeric chat id (private)
-3. Bot ko us channel ka **admin** banao ("Post Messages" permission ke
-   saath)
-4. `python main.py`
+### Risk model
 
-Production deploy (Railway) ke liye `RAILWAY_SETUP.md` dekho — wahan
-persistent volume attach karna zaroori hai warna restarts pe trade
-history reset ho jayegi.
+- Stop: `2.5 × ATR(5m)`, floored at 0.15% of price, widened 40% in thin
+  (Asian / off-hours) sessions.
+- Targets: **TP1 = 1.2R, TP2 = 2.0R, TP3 = 3.0R.**
+- Precision is derived from the live price, not hardcoded per coin.
 
-## Key files
+### Risk guards (all tunable via env vars)
 
-| File | Kaam |
-|------|------|
-| `strategy.py` | Signal scoring engine — thresholds yahan hain |
-| `risk.py` | SL/TP calculation (ATR-based, decimals-aware) |
-| `auto_signal.py` | Background loop jo saare coins ke signals check/post karta hai |
-| `trade_monitor.py` | Open trades ko SL/TP ke against track karta hai |
-| `data.py` | Yahoo Finance se price data (+ Binance/Coinbase fallback), sab coins ke liye generic |
-| `config.py` | `ASSETS` registry (12 coins) + `CHANNEL_ID` |
-| `notify.py` | Channel-broadcast helper — sab jobs isi se message post karte hain |
-| `watchdog.py` | Auto-signal loop stuck/dead detect karke alert bhejta hai |
-| `daily_summary.py` | Roz ka signal/win-rate digest bhejta hai |
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_OPEN_TRADES` | 4 | Concurrent open positions |
+| `MAX_TRADES_PER_DAY` | 12 | Daily signal cap |
+| `MAX_CONSEC_LOSSES` | 4 | Losing streak that trips the breaker |
+| `LOSS_PAUSE_SEC` | 21600 | Pause length after the breaker trips (6h) |
+| `SIGNAL_CYCLE_SEC` | 900 | Full asset scan interval |
+| `SIGNAL_COOLDOWN_SEC` | 900 | Per-asset silence after a signal |
+| `MONITOR_INTERVAL_SEC` | 60 | SL/TP poll interval |
 
-## Config tuning
+---
 
-Signal frequency aur risk:reward `strategy.py` aur `risk.py` ke top
-par defined constants se control hote hain — waha comments mein
-explain kiya gaya hai ki har value ka kya effect hai.
+## Reading the performance report
 
-## Known limitations
+`/perf` reports in **R** — multiples of the risk taken on each trade.
 
-- News filter (`news.py`) sirf high-impact **USD** events check karta
-  hai — sab coins USD-priced hain, isliye ye sab par apply hota hai.
-- `daily_summary.py` server ke local time-zone se chalta hai (jo
-  Railway pe usually UTC hota hai) — `SUMMARY_HOUR` constant adjust
-  karke apna preferred IST time set kar sakte ho.
-- Agar `CHANNEL_ID` set nahi hai ya bot channel ka admin nahi hai, to
-  signals silently skip ho jayenge (logs mein warning aayegi) — DM
-  commands (`/btc` etc.) tab bhi kaam karenge.
+Win rate alone is misleading for a bot that scales out: 40% at +1.85R beats
+70% at +0.2R. **Expectancy is the number that decides whether the strategy
+works.** Positive = the edge is real; negative = it is not, regardless of how
+good the win rate looks.
+
+The R figures assume a **50 / 25 / 25 scale-out** at TP1 / TP2 / TP3. That
+assumption is stated on the report itself. Outcomes settle at:
+
+| Outcome | R |
+|---|---|
+| Stop, no TP1 | −1.00 |
+| Breakeven after TP1 | +0.60 |
+| Breakeven after TP2 | +1.10 |
+| Full TP3 | +1.85 |
+
+---
+
+## Backtesting
+
+```bash
+python backtest.py --days 90                      # all 12 coins
+python backtest.py --days 30 --assets btc,eth,sol
+python backtest.py --days 90 --fee-bps 0          # frictionless, for comparison
+```
+
+Data comes from Binance's public klines endpoint (no API key), cached in
+`backtest_data/`. Yahoo is not usable here — it only serves about 7 days of
+1-minute candles, and 7 days of one regime tells you nothing.
+
+The engine imports the real `strategy.get_signal()`, `risk.calculate_trade()`
+and `effective_decimals()` rather than reimplementing them, so the result
+describes the code that actually runs. It reproduces the 15-minute scan
+cycle, the per-asset cooldown, entry at the signal bar's close, and SL/TP
+resolution on 1-minute bars with the same pessimistic same-bar rule as the
+live monitor. The session filter is driven by each bar's own timestamp
+instead of the wall clock.
+
+**Read the cost line.** The report prints `Avg cost ... R per trade`. At
+Binance taker fees (~20 bps round trip) and a stop of 0.5% of price, costs
+are about 0.4R — so a 1.2R first target is really 0.8R after fees. If that
+line is a large fraction of 1R, the target structure is wrong for the stop
+size, and no amount of signal tuning fixes it.
+
+### What the backtest cannot tell you
+
+- The news filter is skipped, so it takes trades the live bot would sit out.
+- Live entries come off a Yahoo quote; these are Binance closes. Real fills
+  differ, and not in your favour.
+- No order book: a market that gaps through the stop fills worse than the
+  stop price. This assumes you get it.
+- Only pairs that still exist today are in the history.
+- It is **one historical path**. A good number is evidence, not proof, and
+  re-tuning parameters until it improves is how you fit noise. Change
+  settings, then re-check on a period you did not tune on.
+
+---
+
+## What was fixed, and why it mattered
+
+The bot previously showed a 5.41% win rate over 84 signals. That was not the
+strategy losing — it was four accounting and data bugs stacked on top of each
+other. `test_fixes.py` asserts each one is fixed and also demonstrates the old
+broken behaviour so the regression can't quietly return.
+
+**1. Pre-entry bars closed trades instantly.** The monitor fetched "the last
+3 one-minute bars" with no timestamps and evaluated them against trades that
+had just opened. A new trade was judged on three minutes of price action from
+*before its own entry*, so a large share were closed — as a stop, or as a fake
+TP1 that immediately moved the stop to breakeven — on their very first poll.
+This is why `/history` showed rows where Entry and SL were identical.
+Bars are now timestamped and anything starting before entry is discarded.
+
+**2. Stop always beat target in a merged window.** Three bars were collapsed
+into one high/low pair with the stop checked first, so any window touching
+both sides became a loss no matter which came first. Bars are now replayed
+one at a time in order. Inside a *single* bar the order is genuinely unknowable
+from OHLC, so the stop still wins there — the standard pessimistic convention.
+
+**3. Rounding destroyed the risk model on cheap coins.** AVAX was set to 2
+decimals. At $6.26 the whole stop was one cent wide, so a "1:1.2" posted to
+the channel was really 1:1.0. Precision now comes from `effective_decimals()`.
+
+**4. Win rate could exceed 100%.** Wins counted any trade whose TP1 had been
+hit *including still-open ones*, while the denominator counted only closed
+trades. Wins now come from closed trades only.
+
+Also fixed: `original_sl` is preserved when the stop moves to breakeven; the
+monitor no longer pulls five days of 1-minute candles once a minute per asset
+(a fast route to an HTTP 429 that silently stops all trade tracking); trades
+survive a redeploy when Postgres is configured; and the three dead
+`risk_FIXED_OPTION*.py` files plus seven stale documentation files — which
+described settings the code never used and quoted invented win rates — are
+gone.
+
+---
+
+## Project layout
+
+```
+main.py            entry point, command handlers
+config.py          assets, tunables, effective_decimals()
+strategy.py        signal scoring
+indicators.py      EMA/RSI/MACD/ATR/ADX/VWAP/Supertrend
+patterns.py        candlestick patterns
+smart_money.py     liquidity sweeps
+trend.py           multi-timeframe trend
+session.py         London / NY / Asian session state
+risk.py            stop and target placement
+data.py            Yahoo fetch, Binance/Coinbase fallback, 1m bar cache
+auto_signal.py     scan loop
+trade_monitor.py   SL/TP tracking
+trade_tracker.py   trade state, stats
+guards.py          exposure and loss-streak breakers
+analytics.py       R-multiple expectancy, profit factor, drawdown
+persistence.py     Postgres with JSON fallback
+daily_summary.py   daily digest
+watchdog.py        stuck-loop alerts
+news.py            high-impact news pause
+notify.py          channel posting
+formatter.py       message layout
+test_fixes.py      regression suite
+backtest.py        historical replay engine
+backtest_data.py   Binance klines downloader + cache
+```
+
+---
+
+## A note on expectations
+
+Signals are generated from Yahoo Finance data, which is not an exchange feed:
+prices can lag, gap, and occasionally glitch. The bot filters for this, but it
+means fills you'd get on a real exchange will differ from the levels posted.
+Treat `/perf` as a measurement of the *signal logic*, not of a live account.
+
+Start the statistics from zero after deploying these fixes — every number
+collected before them was produced by the bugs described above.

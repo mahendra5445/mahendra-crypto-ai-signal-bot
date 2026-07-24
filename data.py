@@ -362,37 +362,106 @@ def get_candles(asset: str = "btc") -> dict:
     }
 
 
-def get_recent_range(asset: str = "btc", bars: int = 3) -> dict | None:
-    """
-    Last `bars` 1-minute candles ka HIGH / LOW / last CLOSE.
+def _bars_from_payload(result0: dict) -> list[dict]:
+    """Turn a Yahoo chart payload into a list of {ts,open,high,low,close}."""
+    timestamps = result0.get("timestamp") or []
+    quote      = (result0.get("indicators", {}).get("quote") or [{}])[0]
+    opens   = quote.get("open")  or []
+    highs   = quote.get("high")  or []
+    lows    = quote.get("low")   or []
+    closes  = quote.get("close") or []
 
-    KYUN: trade_monitor pehle get_latest_price() use karta tha, jo aakhri 5
-    one-minute CLOSES ka MEDIAN deta hai. Wo do wajah se wins ko chupa
-    raha tha:
-      1. Median jaan-boojh kar spikes ko smooth kar deta hai -- aur TP
-         aksar spike par hi hit hota hai.
-      2. Monitor har 120s par ek hi number dekhta tha. Do poll ke beech
-         TP touch ho kar wapas aa jaye to wo poori tarah invisible tha.
-    SL ke saath ye problem nahi hoti: price SL ke paar jaake wahin rehta
-    hai, to agla poll use pakad hi leta hai. Isliye SL hamesha register
-    hota tha aur TP aksar nahi -- win rate artificially 5% tak gir gaya.
+    bars: list[dict] = []
+    for i, ts in enumerate(timestamps):
+        if ts is None:
+            continue
+        o = opens[i]  if i < len(opens)  else None
+        h = highs[i]  if i < len(highs)  else None
+        l = lows[i]   if i < len(lows)   else None
+        c = closes[i] if i < len(closes) else None
+        if None in (o, h, l, c):
+            continue
+        bars.append({
+            "ts":    int(ts),
+            "open":  float(o),
+            "high":  float(h),
+            "low":   float(l),
+            "close": float(c),
+        })
+    return bars
 
-    High/low use karne se dono taraf ek jaisa insaaf hota hai.
+
+# ── recent 1-minute bars (used by the trade monitor) ─────────────────────
+#
+# A short-lived cache so that N open trades on the same asset, plus any
+# manual command in the same moment, share ONE HTTP request instead of
+# hammering Yahoo. Yahoo rate-limits aggressively (HTTP 429) and a
+# rate-limited monitor silently stops closing trades.
+_RECENT_TTL   = 25          # seconds
+_recent_cache: dict[str, tuple[float, list[dict]]] = {}
+
+
+def get_recent_bars(asset: str = "btc", limit: int = 20) -> list[dict] | None:
     """
+    Last `limit` ONE-MINUTE bars for `asset`, oldest first, each carrying its
+    own unix `ts`. Returns None on failure (caller skips this cycle).
+
+    Two things here matter a great deal, and both were bugs before:
+
+    1. TIMESTAMPS. The old helper returned a single merged high/low for the
+       last 3 bars with no timestamps attached. The trade monitor therefore
+       evaluated a brand-new trade against the three minutes that happened
+       BEFORE it was opened — so a large share of trades were closed as
+       SL or TP1 on their very first poll, using price action that predates
+       the entry. Returning per-bar timestamps lets the monitor discard
+       every bar that started before the entry.
+
+    2. WEIGHT. The old helper called get_asset_tf(), which pulls FIVE DAYS
+       of 1-minute candles (~7000 points) and demands >=200 closed candles,
+       with up to 3 retries. Doing that once a minute per open asset is a
+       fast route to an HTTP 429. This uses range=1d and asks for no
+       minimum, which is all the monitor ever needed.
+
+    The still-forming candle is deliberately KEPT: its high/low is real
+    traded price action, and including it is what lets a TP that is touched
+    and immediately given back still register.
+    """
+    a   = str(asset).lower()
+    now = _time.time()
+
+    cached = _recent_cache.get(a)
+    if cached and (now - cached[0]) < _RECENT_TTL:
+        return cached[1][-limit:]
+
+    cfg = _asset_cfg(a)
+
+    def _pull(sym: str) -> list[dict]:
+        url    = YF_URL.format(symbol=sym)
+        params = {"interval": "1m", "range": "1d"}
+        r = requests.get(url, params=params, headers=YF_HEADERS, timeout=15)
+        r.raise_for_status()
+        payload = r.json()
+        result  = (payload.get("chart", {}) or {}).get("result")
+        if not result:
+            return []
+        return _bars_from_payload(result[0])
+
+    bars: list[dict] = []
     try:
-        tf = get_asset_tf(asset, "1min")
-    except Exception:
+        bars = _pull(cfg["symbol"])
+        if not bars and cfg.get("fallback"):
+            bars = _pull(cfg["fallback"])
+    except Exception as e:
+        logger.warning(f"[BARS] {a.upper()} 1m fetch failed: {e}")
+        # Serve slightly stale cache rather than blinding the monitor
+        if cached:
+            logger.info(f"[BARS] {a.upper()} using stale cache ({int(now - cached[0])}s old)")
+            return cached[1][-limit:]
         return None
 
-    highs = [h for h in (tf.get("high") or []) if h is not None][-bars:]
-    lows  = [l for l in (tf.get("low")  or []) if l is not None][-bars:]
-    closes = [c for c in (tf.get("close") or []) if c is not None]
+    if not bars:
+        return cached[1][-limit:] if cached else None
 
-    if not highs or not lows or not closes:
-        return None
-
-    return {
-        "high":  float(max(highs)),
-        "low":   float(min(lows)),
-        "close": float(closes[-1]),
-    }
+    bars.sort(key=lambda b: b["ts"])
+    _recent_cache[a] = (now, bars)
+    return bars[-limit:]

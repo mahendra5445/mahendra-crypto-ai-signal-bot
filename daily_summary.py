@@ -17,6 +17,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 
+from analytics import performance
 from config import ASSETS
 from notify import notify_channel
 from trade_tracker import get_stats
@@ -49,13 +50,20 @@ def _build_summary_text() -> str:
         lines.append("No signals today.")
         return "\n".join(lines)
 
+    perf = performance(since=today)
     lines.append(
         f"📈 Total Signals : {overall['total']}\n"
+        f"🔵 Still Open    : {overall['open']}\n"
         f"🎯 TP Hit        : {overall['tp']}\n"
         f"⚪ Breakeven     : {overall['be']}\n"
         f"🛑 SL Hit        : {overall['sl']}\n"
         f"🏆 Win Rate      : {overall['win_rate']}%\n"
     )
+    if perf.get("count"):
+        lines.append(
+            f"💹 Net           : {perf['total_r']:+.2f} R "
+            f"({perf['expectancy_r']:+.3f} R/trade)\n"
+        )
 
     lines.append("Per-Asset:")
     any_asset_line = False
