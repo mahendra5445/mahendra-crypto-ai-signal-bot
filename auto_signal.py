@@ -15,8 +15,10 @@ import time
 from config import (
     ASSETS,
     ASSET_LIST,
+    MAX_NEW_TRADES_PER_CYCLE,
     SIGNAL_COOLDOWN_SEC,
     SIGNAL_CYCLE_SEC,
+    STARTUP_DELAY_SEC,
     effective_decimals,
 )
 from data import get_candles, get_latest_price
@@ -51,7 +53,8 @@ def _in_cooldown(asset: str) -> bool:
 
 # ── per-asset check ───────────────────────────────────────────────────────
 
-async def _check_asset(application, asset: str) -> None:
+async def _check_asset(application, asset: str) -> bool:
+    """Returns True if this asset opened a new trade this cycle."""
     cfg   = ASSETS[asset.lower()]
     label = cfg["label"]
 
@@ -71,7 +74,7 @@ async def _check_asset(application, asset: str) -> None:
 
     if result["signal"] == "NO TRADE":
         logger.info(f"[AUTO] {asset.upper()} → No Trade")
-        return
+        return False
 
     # The strategy's entry is the close of the last fully closed 5-minute
     # candle, which can already be minutes stale. Re-price off a near-live
@@ -90,16 +93,16 @@ async def _check_asset(application, asset: str) -> None:
     # ── critical section ──────────────────────────────────────────────────
     async with trade_lock:
         if _in_cooldown(asset):
-            return
+            return False
 
         if message == _last_signal_msg.get(asset):
             logger.info(f"[AUTO] {asset.upper()} duplicate signal skipped")
-            return
+            return False
 
         allowed, reason = can_open(asset)
         if not allowed:
             logger.info(f"[GUARD] {asset.upper()} signal blocked — {reason}")
-            return
+            return False
 
         save_trade(result, asset=asset)
         _last_signal_msg[asset]  = message
@@ -107,6 +110,7 @@ async def _check_asset(application, asset: str) -> None:
 
     await notify_channel(application, message)
     logger.info(f"[AUTO] {asset.upper()} signal posted to channel")
+    return True
 
 
 # ── main job loop ─────────────────────────────────────────────────────────
@@ -114,6 +118,16 @@ async def _check_asset(application, asset: str) -> None:
 async def auto_signal_job(application) -> None:
     logger.info(f"[AUTO] Signal job started — cycle {SIGNAL_CYCLE_SEC}s")
     heartbeat["last_cycle"] = time.time()
+
+    # Warm-up: don't scan the instant we boot. Straight after a redeploy the
+    # data is most likely stale and (on ephemeral storage) the guards have no
+    # history to throttle against, so a boot-time scan is exactly when a burst
+    # of near-identical signals gets posted. Stamp the heartbeat while we wait
+    # so the watchdog doesn't mistake the warm-up for a stuck loop.
+    if STARTUP_DELAY_SEC > 0:
+        logger.info(f"[AUTO] Warm-up — first scan in {STARTUP_DELAY_SEC}s")
+        heartbeat["last_cycle"] = time.time()
+        await asyncio.sleep(STARTUP_DELAY_SEC)
 
     while True:
         try:
@@ -128,9 +142,18 @@ async def auto_signal_job(application) -> None:
         except Exception as e:
             logger.error(f"[AUTO] News check failed: {e}")
 
+        opened = 0
         for asset in ASSET_LIST:
             try:
-                await _check_asset(application, asset)
+                if await _check_asset(application, asset):
+                    opened += 1
+                    if opened >= MAX_NEW_TRADES_PER_CYCLE:
+                        logger.info(
+                            f"[AUTO] Per-cycle cap reached "
+                            f"({opened}/{MAX_NEW_TRADES_PER_CYCLE}) — "
+                            f"remaining coins wait for the next scan"
+                        )
+                        break
             except Exception as e:
                 logger.error(f"[AUTO] {asset.upper()} error: {e}")
 

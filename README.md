@@ -79,6 +79,16 @@ should still be there.
 | `SIGNAL_CYCLE_SEC` | 900 | Full asset scan interval |
 | `SIGNAL_COOLDOWN_SEC` | 900 | Per-asset silence after a signal |
 | `MONITOR_INTERVAL_SEC` | 60 | SL/TP poll interval |
+| `STARTUP_DELAY_SEC` | 60 | Warm-up before the first scan (stops the boot-time burst) |
+| `MAX_NEW_TRADES_PER_CYCLE` | 2 | Cap on new entries opened in one scan (spaces out correlated coins) |
+| `MIN_CONFIRMATIONS` | 9 | Confirmations (of 12) required before a signal is posted & tracked |
+| `MIN_SCORE` | 62 | Minimum weighted score (0–100) required to post |
+
+**Why the burst controls exist:** the 12 coins move together, so a clean
+trend makes several qualify in the same scan. Without a per-cycle cap that
+becomes 3–4 near-identical entries in one minute — and because the first scan
+used to run the instant the process booted, it happened right after every
+redeploy. `STARTUP_DELAY_SEC` + `MAX_NEW_TRADES_PER_CYCLE` fix both.
 
 ---
 

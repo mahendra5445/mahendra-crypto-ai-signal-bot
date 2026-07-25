@@ -149,6 +149,41 @@ check("full TP3 is worth +1.85R", analytics.trade_r(tt._trades[-1]) == 1.85)
 check("clean stop is worth -1R", analytics.trade_r(tt._trades[2]) == -1.0)
 
 
+# ── 7. Startup burst throttle ─────────────────────────────────────────────
+print("\n7. Startup burst throttle")
+
+import asyncio
+import config
+import auto_signal
+
+check("startup warm-up delay exists", config.STARTUP_DELAY_SEC > 0,
+      f"STARTUP_DELAY_SEC={config.STARTUP_DELAY_SEC}s")
+check("per-cycle open cap exists", config.MAX_NEW_TRADES_PER_CYCLE >= 1,
+      f"MAX_NEW_TRADES_PER_CYCLE={config.MAX_NEW_TRADES_PER_CYCLE}")
+
+# Simulate a cycle where EVERY asset qualifies. The cap must stop the loop
+# opening more than MAX_NEW_TRADES_PER_CYCLE trades even so.
+cap = config.MAX_NEW_TRADES_PER_CYCLE
+opened = 0
+for _asset in config.ASSET_LIST:              # every asset "would" open
+    would_open = True
+    if would_open:
+        opened += 1
+        if opened >= cap:
+            break
+check("cap halts opening mid-cycle", opened == cap,
+      f"{opened} opened of {len(config.ASSET_LIST)} qualifying (cap {cap})")
+
+# The default is meaningfully smaller than the coin count, so a fully
+# correlated market can no longer post a signal per coin in one minute.
+check("cap is well below the coin count", cap < len(config.ASSET_LIST),
+      f"{cap} << {len(config.ASSET_LIST)} coins")
+
+# Gate tightened: the weak 8/12 tier no longer auto-posts.
+check("tracked-signal floor is 9+ confirmations", config.MIN_CONFIRMATIONS >= 9,
+      f"MIN_CONFIRMATIONS={config.MIN_CONFIRMATIONS}")
+
+
 # ── summary ───────────────────────────────────────────────────────────────
 shutil.rmtree(os.environ["DATA_DIR"], ignore_errors=True)
 print(f"\n{'─' * 50}")

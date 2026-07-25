@@ -17,6 +17,7 @@ from risk import calculate_trade
 from smart_money import analyze_smart_money
 from patterns import detect_pattern
 from session import get_current_session
+from config import MIN_CONFIRMATIONS, MIN_SCORE
 
 # ==========================
 # MAHENDRA CRYPTO AI SIGNAL - SCORE WEIGHTS (total = 100)
@@ -39,10 +40,10 @@ W_ATR = 4
 W_MTF = 14
 W_LIQUIDITY = 9
 
-MIN_SCORE = 62                 # rescaled from 68/110 to keep the same relative bar on the corrected 0-100 scale
-MIN_CONFIRMATIONS = 8         # relaxed from 9 -> anything below 10 still gets tagged
-                               # "Reduced Risk" (see position_size below) so quality
-                               # is still visible even as more trades pass through
+# MIN_SCORE and MIN_CONFIRMATIONS now come from config.py (env-tunable).
+# Default MIN_CONFIRMATIONS is 9 of 12: a 9-confirmation setup is flagged
+# "Reduced Risk - Half Size" (see position_sizing below) so quality is still
+# visible, while the weaker 8/12 "Quarter Size" tier no longer auto-posts.
 SIGNAL_VALID_MINUTES = 8
 
 STRICT_BULL = {"Strong Bullish", "Bullish"}

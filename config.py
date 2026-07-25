@@ -32,6 +32,31 @@ SIGNAL_CYCLE_SEC     = _int_env("SIGNAL_CYCLE_SEC", 900)    # full asset scan in
 SIGNAL_COOLDOWN_SEC  = _int_env("SIGNAL_COOLDOWN_SEC", 900) # per-asset silence after a signal
 MONITOR_INTERVAL_SEC = _int_env("MONITOR_INTERVAL_SEC", 60) # SL/TP poll interval
 
+# Warm-up before the FIRST scan. Stops the bot from dumping a burst of
+# signals the instant the process boots — the moment data is most likely to
+# be stale straight after a redeploy, and (on ephemeral storage) the moment
+# the guards have zero history to throttle against. Set 0 to scan on boot.
+STARTUP_DELAY_SEC = _int_env("STARTUP_DELAY_SEC", 60)
+
+# Hard cap on how many NEW trades a single scan cycle may open. The 12 coins
+# are highly correlated, so a clean trend makes several of them qualify in
+# the same scan — without this cap that becomes 3-4 near-identical entries in
+# one minute (this is exactly the "deploy ke 1 min baad 3 trade" behaviour).
+# Capping per cycle spaces entries out across cycles instead.
+MAX_NEW_TRADES_PER_CYCLE = _int_env("MAX_NEW_TRADES_PER_CYCLE", 2)
+
+# ==========================================================================
+# SIGNAL GATE  (used by strategy.py)
+# ==========================================================================
+# How many of the 12 confirmations must agree before a signal is posted and
+# tracked, and the minimum weighted score (0-100). Kept here so both are
+# tunable from Railway's Variables tab without editing code.
+#   MIN_CONFIRMATIONS 9  → drops the weakest "Quarter Size" (8/12) tier that
+#                          used to auto-post as a real trade. Lower to 8 only
+#                          if you deliberately want more, lower-quality fills.
+MIN_CONFIRMATIONS = _int_env("MIN_CONFIRMATIONS", 9)
+MIN_SCORE         = _int_env("MIN_SCORE", 62)
+
 # ==========================================================================
 # RISK GUARDS  (enforced in guards.py)
 # ==========================================================================
