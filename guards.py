@@ -13,8 +13,8 @@ correct across restarts.
 
 import logging
 import time
-from datetime import datetime
 
+from clock import today_str
 from config import (
     LOSS_PAUSE_SEC,
     MAX_CONSEC_LOSSES,
@@ -65,7 +65,7 @@ def pause_remaining_sec() -> int:
 
 
 def trades_today() -> int:
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = today_str()
     return sum(1 for t in all_trades() if str(t.get("time", "")).startswith(today))
 
 

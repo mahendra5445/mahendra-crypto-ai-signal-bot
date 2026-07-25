@@ -5,26 +5,26 @@ Sends one digest message per day covering every asset's signal count
 and win rate for that day (based on trade_tracker.get_stats(since=...)),
 so the user doesn't have to manually run /stats to keep track.
 
-Scheduling note: runs at SUMMARY_HOUR:SUMMARY_MINUTE in the SERVER's
-local time (same clock trade_tracker uses for trade["time"], so the
-"today" filter lines up correctly). On Railway this is typically UTC —
-adjust SUMMARY_HOUR below if you want it at a specific IST time instead
-(e.g. IST 23:30 = UTC 18:00 in winter / UTC 18:00 year-round since IST
-has no DST → SUMMARY_HOUR = 18 for a ~11:00 PM IST digest).
+Scheduling note: runs at SUMMARY_HOUR:SUMMARY_MINUTE on the bot's shared
+clock (clock.py), the SAME clock trade_tracker stamps trades with and
+guards counts the day with, so the "today" filter always lines up. That
+clock defaults to IST (BOT_UTC_OFFSET_MIN=330); set that env var to 0 for
+UTC or any other offset. So SUMMARY_HOUR = 21 means 21:00 in whatever
+timezone BOT_UTC_OFFSET_MIN selects — 9:00 PM IST by default.
 """
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
 
 from analytics import performance
+from clock import now_local, today_str
 from config import ASSETS
 from notify import notify_channel
 from trade_tracker import get_stats
 
 logger = logging.getLogger(__name__)
 
-SUMMARY_HOUR = 18     # server-local hour to send the digest (see note above)
+SUMMARY_HOUR = 21     # hour on the shared clock (default 21:00 IST) to send
 SUMMARY_MINUTE = 0
 
 
@@ -33,7 +33,8 @@ async def _notify_all(application, text: str) -> None:
 
 
 def _seconds_until_next_run() -> float:
-    now = datetime.now()
+    from datetime import timedelta
+    now = now_local()
     target = now.replace(hour=SUMMARY_HOUR, minute=SUMMARY_MINUTE, second=0, microsecond=0)
     if target <= now:
         target += timedelta(days=1)
@@ -41,7 +42,7 @@ def _seconds_until_next_run() -> float:
 
 
 def _build_summary_text() -> str:
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = today_str()
     overall = get_stats(since=today)
 
     lines = [f"📅 DAILY SUMMARY — {today}\n"]
@@ -86,7 +87,7 @@ def _build_summary_text() -> str:
 async def daily_summary_job(application) -> None:
     logger.info(
         f"[DAILY SUMMARY] Started — will send daily at "
-        f"{SUMMARY_HOUR:02d}:{SUMMARY_MINUTE:02d} server-local time"
+        f"{SUMMARY_HOUR:02d}:{SUMMARY_MINUTE:02d} bot-clock time"
     )
     while True:
         await asyncio.sleep(_seconds_until_next_run())

@@ -12,8 +12,8 @@ Every trade now records enough to be audited after the fact:
 
 import logging
 import time
-from datetime import datetime
 
+from clock import fmt_ts
 from persistence import load_trades_from_disk, save_trades_to_disk
 
 logger = logging.getLogger(__name__)
@@ -95,7 +95,7 @@ def save_trade(result: dict, asset: str = "btc") -> dict | None:
         "opened_ts":   now,
         "closed_ts":   None,
         "exit_price":  None,
-        "time":        datetime.fromtimestamp(now).strftime("%Y-%m-%d %H:%M:%S"),
+        "time":        fmt_ts(now),
     }
 
     _next_id += 1

@@ -188,7 +188,19 @@ def trade_r(trade: dict, fee_r: float) -> float:
 # ── the run ───────────────────────────────────────────────────────────────
 
 def run_asset(asset: str, bars_1m: list[dict], fee_bps: float) -> list[dict]:
-    _real_session = strategy.get_current_session   # restored before returning
+    # run_asset monkey-patches strategy.get_current_session so the signal
+    # engine derives the session from the bar being replayed, not the wall
+    # clock. try/finally guarantees the real function is restored even if
+    # get_signal or simulate_trade raises mid-loop — otherwise a single bad
+    # bar would leave the whole process running on the patched session.
+    _real_session = strategy.get_current_session
+    try:
+        return _run_asset_body(asset, bars_1m, fee_bps)
+    finally:
+        strategy.get_current_session = _real_session
+
+
+def _run_asset_body(asset: str, bars_1m: list[dict], fee_bps: float) -> list[dict]:
     bars_5m  = resample(bars_1m, 5)
     bars_15m = resample(bars_1m, 15)
 
@@ -284,7 +296,6 @@ def run_asset(asset: str, bars_1m: list[dict], fee_bps: float) -> list[dict]:
         cooldown_until_ts = now_ts + config.SIGNAL_COOLDOWN_SEC * 1000
         open_until_ts     = trade["closed_ts"]
 
-    strategy.get_current_session = _real_session
     return trades
 
 

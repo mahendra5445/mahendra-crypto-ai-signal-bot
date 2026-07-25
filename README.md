@@ -83,6 +83,7 @@ should still be there.
 | `MAX_NEW_TRADES_PER_CYCLE` | 2 | Cap on new entries opened in one scan (spaces out correlated coins) |
 | `MIN_CONFIRMATIONS` | 9 | Confirmations (of 12) required before a signal is posted & tracked |
 | `MIN_SCORE` | 62 | Minimum weighted score (0–100) required to post |
+| `BOT_UTC_OFFSET_MIN` | 330 | Minutes past UTC for the bot's day boundary & timestamps (330 = IST). Set 0 for UTC. Controls the daily trade cap reset, the digest time, and the time shown on each trade |
 
 **Why the burst controls exist:** the 12 coins move together, so a clean
 trend makes several qualify in the same scan. Without a per-cycle cap that
