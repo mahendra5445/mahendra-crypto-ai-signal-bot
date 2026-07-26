@@ -35,7 +35,6 @@ DEFAULT_WEIGHTS = {
     "mitigation_block": 0.7,
     "fake_breakout": 0.9,
     "institutional_zone": 0.5,
-    "cvd_divergence": 0.8,
 }
 
 

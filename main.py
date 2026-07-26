@@ -26,7 +26,6 @@ from mahendra_bot import trade_management as tm
 from mahendra_bot import journal as jr
 from mahendra_bot import regime as rg
 from mahendra_bot import data_layer as dl
-from mahendra_bot import validation as val
 
 CSV_PATH = "/home/claude/data/BTCUSDT-1m-2026-05.csv"
 OUT_DIR = "/home/claude/mahendra_bot/output"
@@ -54,8 +53,6 @@ def build_features(df: pd.DataFrame) -> pd.DataFrame:
     f["buy_sell_ratio"] = ind.buy_sell_ratio(df)
     f["delta_vol"] = ind.delta_volume(df)
     f["low_liquidity"] = ind.low_liquidity_flag(df)
-    f["cvd"] = ind.cvd(df)                                            # CVD
-    f["cvd_divergence"] = ind.cvd_divergence(df["close"], f["cvd"])    # CVD divergence vote
     return f
 
 
@@ -100,7 +97,6 @@ def build_votes_row(i, df, feats, structure_df, session_df, tf30_trend, tf1h_tre
     votes["mitigation_block"] = event_flags["mitigation"].iloc[i]
     votes["fake_breakout"] = event_flags["fake_breakout"].iloc[i]
     votes["institutional_zone"] = event_flags["institutional"].iloc[i]
-    votes["cvd_divergence"] = float(fr["cvd_divergence"]) if not np.isnan(fr["cvd_divergence"]) else 0
     return votes
 
 
@@ -183,119 +179,7 @@ def precompute_event_flags(df, ob_list, fvg_list, pd_zone, sweeps, sme_entries,
     }
 
 
-def simulate_bars(df, feats, structure_df, session_df, tf30_trend, tf1h_trend, event_flags,
-                   weight_store, risk_cfg, trade_cfg, start_idx, end_idx, learn=True,
-                   db_path=":memory:"):
-    """
-    The actual signal-generation + trade-simulation loop, factored out of
-    run_backtest so it can be re-run on an arbitrary [start_idx, end_idx)
-    bar range with a caller-supplied weight_store. This is what makes
-    walk-forward validation (validation.py) possible without duplicating
-    the trading logic: a fold's TRAIN slice calls this with learn=True (the
-    self-learning weights adapt), and its TEST slice calls it again with
-    learn=False (weights frozen, genuine out-of-sample).
-
-    Also where commission and latency/slippage simulation are applied:
-    every entry and exit fill is run through
-    trade_management.apply_latency_slippage(), and every closed trade has
-    trade_management.commission_r() subtracted from its pnl_r before
-    logging — so the reported numbers already include real trading friction.
-
-    Returns the closed-trades DataFrame for this bar range.
-    """
-    risk_mgr = rk.RiskManager(risk_cfg)
-    journal = jr.TradeJournal(db_path)
-    open_trade = None
-    ts_series = pd.to_datetime(df["open_time"], unit="us")
-    risk_amount = risk_cfg.account_balance * (risk_cfg.risk_per_trade_pct / 100)
-
-    for i in range(start_idx, end_idx):
-        bar = df.iloc[i]
-        ts = ts_series.iloc[i].to_pydatetime()
-        a = feats["atr"].iloc[i]
-
-        if open_trade is not None:
-            closed, reason, exit_price, pnl_r = tm.update_trade(open_trade, bar, i, a, trade_cfg)
-            if closed:
-                # Latency/slippage on the exit fill (item: latency simulation).
-                slipped_exit = tm.apply_latency_slippage(
-                    exit_price, "short" if open_trade.direction == "long" else "long",
-                    a, trade_cfg,
-                )
-                # Commission simulation: round-trip fee, expressed in R, subtracted here.
-                fee_r = tm.commission_r(open_trade.entry, open_trade.size, risk_amount, trade_cfg)
-                pnl_r_net = pnl_r - fee_r
-                pnl_pct = pnl_r_net * risk_cfg.risk_per_trade_pct
-                journal.log_trade(
-                    {
-                        "signal_key": f"{open_trade.entry_bar}-{open_trade.direction}",
-                        "entry_time": ts_series.iloc[open_trade.entry_bar].isoformat(),
-                        "exit_time": ts.isoformat(),
-                        "direction": open_trade.direction,
-                        "entry_price": open_trade.entry,
-                        "exit_price": slipped_exit,
-                        "stop_loss": open_trade.stop_loss,
-                        "size": open_trade.size,
-                        "pnl_r": pnl_r_net,
-                        "pnl_pct": pnl_pct,
-                        "exit_reason": reason,
-                        "confirmations": open_trade.confirmations,
-                        "ai_score": open_trade.ai_score,
-                    }
-                )
-                risk_mgr.register_trade_close(pnl_pct)
-                open_trade = None
-            continue  # only manage one trade at a time (max_open_trades=1)
-
-        votes = build_votes_row(i, df, feats, structure_df, session_df, tf30_trend, tf1h_trend, event_flags)
-        result = sc.compute_ai_score(votes, weight_store.weights)
-        if result["direction"] == "neutral":
-            continue
-        if not sc.minimum_confirmation_score(result, min_score=68):
-            continue
-        if feats["low_liquidity"].iloc[i]:
-            continue
-
-        raw_entry = bar["close"]
-        if np.isnan(a) or a <= 0:
-            continue
-
-        # item 1 wired in: reject signals during abnormal/erratic volatility spikes
-        atr_z = feats["atr_z"].iloc[i]
-        if not np.isnan(atr_z) and abs(atr_z) > 4:
-            continue
-
-        direction = "long" if result["direction"] == "long" else "short"
-        # Latency/slippage on the entry fill (item: latency simulation).
-        entry = tm.apply_latency_slippage(raw_entry, direction, a, trade_cfg)
-
-        # Bucket price into ~0.5-ATR bands so a genuinely repeated signal at the
-        # same level/direction gets blocked (a raw bar-index key is always
-        # unique and would never trigger this protection).
-        price_bucket = round(entry / (a * 0.5)) if a > 0 else round(entry)
-        signal_key = f"{result['direction']}-{price_bucket}"
-        can_trade, why = risk_mgr.can_trade(ts, signal_key)
-        if not can_trade:
-            continue
-        stop_loss = entry - a * trade_cfg.atr_sl_mult if direction == "long" else entry + a * trade_cfg.atr_sl_mult
-        size = risk_mgr.position_size(entry, stop_loss)
-        if size <= 0:
-            continue
-
-        open_trade = tm.OpenTrade(
-            direction=direction, entry=entry, stop_loss=stop_loss,
-            initial_risk=abs(entry - stop_loss), size=size, entry_bar=i,
-            confirmations=result["confirmations"], ai_score=result["score"],
-        )
-        risk_mgr.register_trade_open(ts, signal_key)
-
-    trades_df = journal.to_dataframe()
-    if learn:
-        weight_store.update_from_trades(trades_df)
-    return trades_df
-
-
-def run_backtest(max_bars=None, n_wf_folds=5, n_mc_sims=5000):
+def run_backtest(max_bars=None):
     print("Loading + integrity-checking data...")
     df = dl.load_klines_csv(CSV_PATH, max_bars=max_bars)
     print(f"{len(df)} bars loaded.")
@@ -352,69 +236,101 @@ def run_backtest(max_bars=None, n_wf_folds=5, n_mc_sims=5000):
         risk_per_trade_pct=cfg["risk_per_trade_pct"],
         max_open_trades=cfg["max_open_trades"],
     )
+
+    risk_mgr = rk.RiskManager(risk_cfg)
     trade_cfg = tm.TradeConfig()
+    journal = jr.TradeJournal(os.path.join(OUT_DIR, "mahendra.db"))
 
-    print("Running signal generation + trade simulation loop (commission + latency simulated)...")
-    trades_df = simulate_bars(
-        df, feats, structure_df, session_df, tf30_trend, tf1h_trend, event_flags,
-        weight_store, risk_cfg, trade_cfg, start_idx=60, end_idx=len(df), learn=True,
-        db_path=os.path.join(OUT_DIR, "mahendra.db"),
-    )
+    open_trade = None
+    ts_series = pd.to_datetime(df["open_time"], unit="us")
 
+    print("Running signal generation + trade simulation loop...")
+    for i in range(60, len(df)):
+        bar = df.iloc[i]
+        ts = ts_series.iloc[i].to_pydatetime()
+
+        if open_trade is not None:
+            closed, reason, exit_price, pnl_r = tm.update_trade(
+                open_trade, bar, i, feats["atr"].iloc[i], trade_cfg
+            )
+            if closed:
+                pnl_pct = pnl_r * risk_cfg.risk_per_trade_pct
+                journal.log_trade(
+                    {
+                        "signal_key": f"{open_trade.entry_bar}-{open_trade.direction}",
+                        "entry_time": ts_series.iloc[open_trade.entry_bar].isoformat(),
+                        "exit_time": ts.isoformat(),
+                        "direction": open_trade.direction,
+                        "entry_price": open_trade.entry,
+                        "exit_price": exit_price,
+                        "stop_loss": open_trade.stop_loss,
+                        "size": open_trade.size,
+                        "pnl_r": pnl_r,
+                        "pnl_pct": pnl_pct,
+                        "exit_reason": reason,
+                        "confirmations": open_trade.confirmations,
+                        "ai_score": open_trade.ai_score,
+                    }
+                )
+                risk_mgr.register_trade_close(pnl_pct)
+                open_trade = None
+            continue  # only manage one trade at a time (max_open_trades=1)
+
+        votes = build_votes_row(i, df, feats, structure_df, session_df, tf30_trend, tf1h_trend, event_flags)
+        result = sc.compute_ai_score(votes, weight_store.weights)
+        if result["direction"] == "neutral":
+            continue
+        if not sc.minimum_confirmation_score(result, min_score=68):
+            continue
+        if feats["low_liquidity"].iloc[i]:
+            continue
+
+        entry = bar["close"]
+        a = feats["atr"].iloc[i]
+        if np.isnan(a) or a <= 0:
+            continue
+
+        # item 1 wired in: reject signals during abnormal/erratic volatility spikes
+        atr_z = feats["atr_z"].iloc[i]
+        if not np.isnan(atr_z) and abs(atr_z) > 4:
+            continue
+
+        # Bucket price into ~0.5-ATR bands so a genuinely repeated signal at the
+        # same level/direction gets blocked (a raw bar-index key is always
+        # unique and would never trigger this protection).
+        price_bucket = round(entry / (a * 0.5)) if a > 0 else round(entry)
+        signal_key = f"{result['direction']}-{price_bucket}"
+        can_trade, why = risk_mgr.can_trade(ts, signal_key)
+        if not can_trade:
+            continue
+        direction = "long" if result["direction"] == "long" else "short"
+        stop_loss = entry - a * trade_cfg.atr_sl_mult if direction == "long" else entry + a * trade_cfg.atr_sl_mult
+        size = risk_mgr.position_size(entry, stop_loss)
+        if size <= 0:
+            continue
+
+        open_trade = tm.OpenTrade(
+            direction=direction, entry=entry, stop_loss=stop_loss,
+            initial_risk=abs(entry - stop_loss), size=size, entry_bar=i,
+            confirmations=result["confirmations"], ai_score=result["score"],
+        )
+        risk_mgr.register_trade_open(ts, signal_key)
+
+    trades_df = journal.to_dataframe()
     report = jr.performance_report(trades_df)
     monthly = jr.monthly_report(trades_df)
 
-    jr.TradeJournal(os.path.join(OUT_DIR, "mahendra.db")).export_csv(
-        os.path.join(OUT_DIR, "trade_journal.csv")
-    )
+    weight_store.update_from_trades(trades_df)
+
+    journal.export_csv(os.path.join(OUT_DIR, "trade_journal.csv"))
     monthly.to_csv(os.path.join(OUT_DIR, "monthly_report.csv"))
     with open(os.path.join(OUT_DIR, "performance_report.json"), "w") as f:
         json.dump(report, f, indent=2, default=str)
 
-    print("\n=== PERFORMANCE REPORT (in-sample, commission+latency included) ===")
+    print("\n=== PERFORMANCE REPORT ===")
     print(json.dumps(report, indent=2, default=str))
     print(f"\nRegime distribution:\n{regime.value_counts()}")
     print(f"\nVolatility regime distribution:\n{vol_regime.value_counts()}")
-
-    # --- Walk-Forward Optimization: genuine out-of-sample validation ---
-    print(f"\nRunning walk-forward validation ({n_wf_folds} folds)...")
-
-    # Each fold must start learning from the SAME clean default weights, not
-    # whatever the previous fold's train slice adapted them to — otherwise
-    # fold N+1 secretly inherits fold N's fitted state and the folds are no
-    # longer independent out-of-sample tests. Give every fold its own
-    # throwaway weights file and delete it immediately after.
-    _wf_fold_counter = {"n": 0}
-
-    def fresh_weight_store():
-        _wf_fold_counter["n"] += 1
-        path = os.path.join(OUT_DIR, f"_wf_weights_tmp_{_wf_fold_counter['n']}.json")
-        if os.path.exists(path):
-            os.remove(path)
-        return sc.WeightStore(path)
-
-    wf_trades, wf_folds = val.run_walk_forward(
-        df, feats, structure_df, session_df, tf30_trend, tf1h_trend, event_flags,
-        fresh_weight_store, risk_cfg, trade_cfg, simulate_bars, n_folds=n_wf_folds,
-    )
-    wf_report = jr.performance_report(wf_trades)
-    print("=== WALK-FORWARD (out-of-sample only) ===")
-    print(json.dumps({"per_fold": wf_folds, "combined_oos": wf_report}, indent=2, default=str))
-    with open(os.path.join(OUT_DIR, "walk_forward_report.json"), "w") as f:
-        json.dump({"per_fold": wf_folds, "combined_oos": wf_report}, f, indent=2, default=str)
-    for n in range(1, _wf_fold_counter["n"] + 1):
-        p = os.path.join(OUT_DIR, f"_wf_weights_tmp_{n}.json")
-        if os.path.exists(p):
-            os.remove(p)
-
-    # --- Monte Carlo Backtesting: sequence-risk / robustness check ---
-    print(f"\nRunning Monte Carlo backtest ({n_mc_sims} sims on in-sample trades)...")
-    mc_report = val.monte_carlo_backtest(trades_df["pnl_r"] if not trades_df.empty else pd.Series(dtype=float),
-                                          n_sims=n_mc_sims)
-    print("=== MONTE CARLO ===")
-    print(json.dumps(mc_report, indent=2, default=str))
-    with open(os.path.join(OUT_DIR, "monte_carlo_report.json"), "w") as f:
-        json.dump(mc_report, f, indent=2, default=str)
 
     return report, trades_df
 

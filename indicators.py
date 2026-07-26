@@ -147,32 +147,6 @@ def delta_volume(df: pd.DataFrame) -> pd.Series:
     return df["taker_buy_base"] - (df["volume"] - df["taker_buy_base"])
 
 
-def cvd(df: pd.DataFrame) -> pd.Series:
-    """
-    Cumulative Volume Delta. Real, not approximated: Binance klines already
-    report `taker_buy_base` per bar, so per-bar delta = taker_buy - taker_sell
-    is exact (not tick-level, but exact at the bar-aggregation Binance itself
-    reports), and CVD is just its running total.
-    """
-    return delta_volume(df).cumsum()
-
-
-def cvd_divergence(close: pd.Series, cvd_series: pd.Series, lookback: int = 20) -> pd.Series:
-    """
-    Flags bearish/bullish divergence between price and CVD over `lookback`
-    bars: price makes a higher high while CVD makes a lower high (bearish,
-    -1), or price makes a lower low while CVD makes a higher low (bullish,
-    +1). Otherwise 0.
-    """
-    price_hh = close > close.rolling(lookback).max().shift(1)
-    price_ll = close < close.rolling(lookback).min().shift(1)
-    cvd_rising = cvd_series > cvd_series.shift(lookback)
-    bearish_div = price_hh & ~cvd_rising
-    bullish_div = price_ll & cvd_rising
-    out = np.where(bearish_div, -1, np.where(bullish_div, 1, 0))
-    return pd.Series(out, index=close.index)
-
-
 def low_liquidity_flag(df: pd.DataFrame, lookback=50, pct=0.3) -> pd.Series:
     v = df["volume"]
     thresh = v.rolling(lookback).mean() * pct

@@ -64,29 +64,6 @@ Your CSV is historical BTCUSDT spot/futures klines only. These items need **exte
 
 Everything else runs today, offline, on your file.
 
-## New in this pass (10 items requested)
-| # | Item | What actually happened |
-|---|---|---|
-|1|Real Open Interest API|`live_data.get_open_interest()` — real Binance Futures `openInterestHist` call. **Live-only** (see below).|
-|2|Real Funding Rate API|`live_data.get_funding_rate()` — real Binance Futures `premiumIndex` call. **Live-only**.|
-|3|Binance Long/Short Ratio|`live_data.get_long_short_ratio()` — real `globalLongShortAccountRatio` call. **Live-only**.|
-|4|Fear & Greed Index|`live_data.get_fear_greed_index()` — real alternative.me call, free, no key. **Live-only**.|
-|5|Cumulative Volume Delta (CVD)|`indicators.cvd()` + `cvd_divergence()` — real, from your file's own `taker_buy_base`/`volume` columns. **Backtested**: wired into the AI score as a live vote.|
-|6|Commission Simulation|`trade_management.commission_r()` — round-trip taker fee (0.04%/side default) deducted from every trade's R before logging. **Backtested**.|
-|7|Latency Simulation|`trade_management.apply_latency_slippage()` — every entry/exit fill is slipped by a spread cost + an ATR-scaled amount for the simulated order latency (250ms default), always adverse. **Backtested**.|
-|8|Walk-Forward Optimization|`validation.run_walk_forward()` — 5 rolling folds; weights adapt on each fold's train slice, freeze, then run out-of-sample on the test slice. Only OOS trades count toward the reported result. **Backtested**.|
-|9|Monte Carlo Backtesting|`validation.monte_carlo_backtest()` — 5,000 bootstrap resamples of your realized trade R-multiples, giving a percentile range for final equity and max drawdown instead of one lucky/unlucky sequence. **Backtested**.|
-|10|Real API for Funding/OI/Dominance/Calendar/Correlation|`sessions_external.py` now forwards to `live_data.py` real calls for funding, OI, dominance, and long/short ratio. ETH-BTC correlation is real once you fetch matching historical ETH candles via `live_data.get_eth_klines()`. The economic calendar stays a documented stub — see below.|
-
-### Why items 1-4 (and dominance) are "live-only," not backtested
-Open Interest, Funding Rate, Long/Short Ratio, Fear & Greed and BTC Dominance are all **current-snapshot** endpoints — there's no free historical time series from Binance/CoinGecko/alternative.me that lines up 1:1 with your May-2026 1-minute bars. Attaching *today's* funding rate to a *May-2026* candle would be lookahead-shaped noise dressed up as a real signal, so it's deliberately **not** wired into the historical backtest loop in `main.py`. Instead:
-- `live_data.py` has real, working functions for all of them — call `live_market_filter()` from a live/forward-testing loop and they'll return today's actual values.
-- The one exception is ETH price: Binance's public klines endpoint does return real historical candles for any past window, so `eth_btc_correlation()` becomes genuinely backtestable once you pull the matching range with `get_eth_klines(start_time=..., end_time=...)`.
-- The economic calendar (items 57-62) is left as a **documented stub** — there's no free, keyless, ToS-safe calendar API (ForexFactory/Investing.com require scraping that breaks their ToS; TradingEconomics/Finnhub need a paid key). Plug a paid key into `live_data.economic_calendar_events()` when you have one.
-
-### Sandbox limitation
-This review/build ran in an environment with outbound network access disabled, so the real API calls in `live_data.py` could not be executed or smoke-tested here. Endpoints, params, and response field names match the current public Binance Futures/Spot, CoinGecko, and alternative.me docs — run `python3 live_data.py` on a machine with internet access before depending on it live. Everything else (CVD, commission, latency, walk-forward, Monte Carlo) was run end-to-end on synthetic OHLCV data in this sandbox and confirmed working; re-run `python3 main.py` on your real file to get real numbers — the synthetic-data numbers in this sandbox are meaningless and not reported here.
-
 ## Honest caveats
 - SMC constructs (order blocks, breaker/mitigation blocks, inducement, etc.) have no single industry-standard formula — these are reasonable, configurable rule-based approximations, not "the" definition.
 - The AI score is a transparent weighted-vote system with a self-learning weight update, not a trained ML model — that's a realistic and auditable starting point; a real ML classifier would need labeled multi-month/multi-symbol data.
