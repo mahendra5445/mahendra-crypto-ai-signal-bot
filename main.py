@@ -17,16 +17,16 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import indicators as ind
-import smc
-import sessions_external as sess
-import scoring as sc
-import risk as rk
-import trade_management as tm
-import journal as jr
-import regime as rg
-import data_layer as dl
-import validation as val
+from mahendra_bot import indicators as ind
+from mahendra_bot import smc
+from mahendra_bot import sessions_external as sess
+from mahendra_bot import scoring as sc
+from mahendra_bot import risk as rk
+from mahendra_bot import trade_management as tm
+from mahendra_bot import journal as jr
+from mahendra_bot import regime as rg
+from mahendra_bot import data_layer as dl
+from mahendra_bot import validation as val
 
 CSV_PATH = "/home/claude/data/BTCUSDT-1m-2026-05.csv"
 OUT_DIR = "/home/claude/mahendra_bot/output"
@@ -217,18 +217,14 @@ def simulate_bars(df, feats, structure_df, session_df, tf30_trend, tf1h_trend, e
         if open_trade is not None:
             closed, reason, exit_price, pnl_r = tm.update_trade(open_trade, bar, i, a, trade_cfg)
             if closed:
-                # Latency/slippage on the exit fill — this now genuinely
-                # changes pnl_r (not just the logged label). See
-                # trade_management.slipped_exit_and_pnl for why stop_loss/
-                # time_exit/weak_trade_close (real price fills) and
-                # tp3_full_close (idealized R-target fill) need different
-                # treatment.
-                pnl_r_slipped, slipped_exit = tm.slipped_exit_and_pnl(
-                    open_trade, exit_price, reason, pnl_r, a, trade_cfg
+                # Latency/slippage on the exit fill (item: latency simulation).
+                slipped_exit = tm.apply_latency_slippage(
+                    exit_price, "short" if open_trade.direction == "long" else "long",
+                    a, trade_cfg,
                 )
                 # Commission simulation: round-trip fee, expressed in R, subtracted here.
                 fee_r = tm.commission_r(open_trade.entry, open_trade.size, risk_amount, trade_cfg)
-                pnl_r_net = pnl_r_slipped - fee_r
+                pnl_r_net = pnl_r - fee_r
                 pnl_pct = pnl_r_net * risk_cfg.risk_per_trade_pct
                 journal.log_trade(
                     {
@@ -270,17 +266,7 @@ def simulate_bars(df, feats, structure_df, session_df, tf30_trend, tf1h_trend, e
             continue
 
         direction = "long" if result["direction"] == "long" else "short"
-        # Latency/slippage on the entry fill. IMPORTANT: the stop-loss must
-        # stay anchored to the INTENDED signal price (raw_entry), not to the
-        # slipped fill — if the stop were re-derived from the slipped entry,
-        # the risk distance would always come out to exactly atr_sl_mult*ATR
-        # regardless of slippage, silently canceling out the whole point of
-        # simulating it. Anchoring to raw_entry means an adverse fill
-        # genuinely costs you extra risk distance, which is the real effect.
-        intended_stop = (
-            raw_entry - a * trade_cfg.atr_sl_mult if direction == "long"
-            else raw_entry + a * trade_cfg.atr_sl_mult
-        )
+        # Latency/slippage on the entry fill (item: latency simulation).
         entry = tm.apply_latency_slippage(raw_entry, direction, a, trade_cfg)
 
         # Bucket price into ~0.5-ATR bands so a genuinely repeated signal at the
@@ -291,7 +277,7 @@ def simulate_bars(df, feats, structure_df, session_df, tf30_trend, tf1h_trend, e
         can_trade, why = risk_mgr.can_trade(ts, signal_key)
         if not can_trade:
             continue
-        stop_loss = intended_stop
+        stop_loss = entry - a * trade_cfg.atr_sl_mult if direction == "long" else entry + a * trade_cfg.atr_sl_mult
         size = risk_mgr.position_size(entry, stop_loss)
         if size <= 0:
             continue

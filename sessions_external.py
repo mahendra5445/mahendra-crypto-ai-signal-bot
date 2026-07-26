@@ -13,7 +13,7 @@ sessions_external.py
 import pandas as pd
 import numpy as np
 
-import live_data as ld
+from mahendra_bot import live_data as ld
 
 
 def utc_hour(df: pd.DataFrame) -> pd.Series:

@@ -87,13 +87,6 @@ Open Interest, Funding Rate, Long/Short Ratio, Fear & Greed and BTC Dominance ar
 ### Sandbox limitation
 This review/build ran in an environment with outbound network access disabled, so the real API calls in `live_data.py` could not be executed or smoke-tested here. Endpoints, params, and response field names match the current public Binance Futures/Spot, CoinGecko, and alternative.me docs — run `python3 live_data.py` on a machine with internet access before depending on it live. Everything else (CVD, commission, latency, walk-forward, Monte Carlo) was run end-to-end on synthetic OHLCV data in this sandbox and confirmed working; re-run `python3 main.py` on your real file to get real numbers — the synthetic-data numbers in this sandbox are meaningless and not reported here.
 
-## Post-build audit — 2 real bugs found and fixed in the latency simulation
-A follow-up audit caught that the first cut of latency/slippage simulation looked correct but had **zero actual effect on the numbers**:
-1. **Entry side:** the stop-loss was being re-derived from the already-slipped entry price (`stop = slipped_entry ± ATR*mult`), so the risk distance always came out to exactly `atr_sl_mult * ATR` no matter how much slippage was applied — the slippage canceled itself out. Fixed by anchoring the stop to the *intended* signal price instead, so an adverse fill now genuinely costs extra risk distance.
-2. **Exit side:** a slipped exit price was computed and written to the trade journal, but `pnl_r` was still calculated from the original, unslipped exit price — the slippage only changed a label, never the PnL. Fixed with `trade_management.slipped_exit_and_pnl()`, which re-derives the R-multiple from the slipped price for real price-based exits (stop-loss/time-exit/weak-trade-close) and applies an approximated R-based tax for the idealized TP3 fixed-R-target exit.
-
-Verified with a standalone before/after check: a stop-out that used to land at exactly `-1.00R` (friction included only in appearance) now lands at `-1.19R` once slippage (`-0.14R`) and commission (`-0.05R`) are genuinely subtracted — see the numbers change in `git diff` on `trade_management.py`/`main.py` if you want to confirm yourself.
-
 ## Honest caveats
 - SMC constructs (order blocks, breaker/mitigation blocks, inducement, etc.) have no single industry-standard formula — these are reasonable, configurable rule-based approximations, not "the" definition.
 - The AI score is a transparent weighted-vote system with a self-learning weight update, not a trained ML model — that's a realistic and auditable starting point; a real ML classifier would need labeled multi-month/multi-symbol data.

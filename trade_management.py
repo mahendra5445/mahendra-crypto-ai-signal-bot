@@ -90,42 +90,6 @@ def commission_r(entry_price: float, size: float, risk_amount: float,
     return fee_amount / risk_amount
 
 
-def slipped_exit_and_pnl(trade: OpenTrade, exit_price: float, reason: str, pnl_r: float,
-                          atr_value: float, cfg: TradeConfig):
-    """
-    Applies latency/slippage to the EXIT fill and returns the corrected
-    (pnl_r, exit_price_after_slippage) — this is what actually makes
-    latency simulation cost something, instead of only relabelling the
-    logged exit price while leaving pnl_r untouched.
-
-    stop_loss / time_exit / weak_trade_close are genuine price-based fills:
-    the exit price is slipped, and the final open leg's R (scaled by
-    whatever remaining_pct was still open) is re-derived from the slipped
-    price instead of the raw one.
-
-    tp3_full_close is an idealized fixed-R target fill (partial TPs in this
-    engine are booked at their configured R target, not derived from the
-    candle's actual price) — there's no raw fill price to re-derive R from,
-    so it gets a slippage tax approximated directly in R terms instead.
-    """
-    exit_side = "short" if trade.direction == "long" else "long"
-    slipped_price = apply_latency_slippage(exit_price, exit_side, atr_value, cfg)
-
-    if reason in ("stop_loss", "time_exit", "weak_trade_close"):
-        raw_r = r_multiple(trade, exit_price)
-        slipped_r = r_multiple(trade, slipped_price)
-        pnl_r_adj = pnl_r + (slipped_r - raw_r) * trade.remaining_pct
-    else:  # tp3_full_close — idealized R-target fill, tax it in R units directly
-        if atr_value is None or atr_value != atr_value:
-            atr_value = 0.0
-        slip_price_amount = exit_price * (cfg.slippage_bps / 10000) + \
-            atr_value * cfg.latency_atr_fraction * (cfg.latency_ms / 60000)
-        slip_r = (slip_price_amount / trade.initial_risk) if trade.initial_risk else 0.0
-        pnl_r_adj = pnl_r - slip_r * trade.remaining_pct
-
-    return pnl_r_adj, slipped_price
-
-
 def update_trade(trade: OpenTrade, bar, bar_index: int, atr_value: float, cfg: TradeConfig):
     """
     Advances one open trade by one bar. Mutates `trade` in place.
