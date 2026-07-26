@@ -38,7 +38,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-from mahendra_bot import data_layer as dl
+import data_layer as dl
 
 BINANCE_FAPI = "https://fapi.binance.com"
 BINANCE_SPOT = "https://api.binance.com"

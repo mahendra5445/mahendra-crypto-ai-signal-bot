@@ -17,16 +17,16 @@ import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mahendra_bot import indicators as ind
-from mahendra_bot import smc
-from mahendra_bot import sessions_external as sess
-from mahendra_bot import scoring as sc
-from mahendra_bot import risk as rk
-from mahendra_bot import trade_management as tm
-from mahendra_bot import journal as jr
-from mahendra_bot import regime as rg
-from mahendra_bot import data_layer as dl
-from mahendra_bot import validation as val
+import indicators as ind
+import smc
+import sessions_external as sess
+import scoring as sc
+import risk as rk
+import trade_management as tm
+import journal as jr
+import regime as rg
+import data_layer as dl
+import validation as val
 
 CSV_PATH = "/home/claude/data/BTCUSDT-1m-2026-05.csv"
 OUT_DIR = "/home/claude/mahendra_bot/output"
