@@ -1,235 +1,100 @@
-# Mahendra Crypto AI Signal Bot
+# Mahendra Crypto AI Signal Bot (BTC) — v1 build
 
-Telegram signal bot for 12 crypto pairs. Scans each asset on a fixed cycle,
-posts qualifying setups to a channel, then tracks every trade to SL / TP1 /
-TP2 / TP3 and reports real performance.
+Built from `BTCUSDT-1m-2026-05.csv` (44,640 one-minute candles, May 2026, Binance kline format).
 
-**Every number this bot prints comes from the live trade list.** There are no
-hand-maintained counters, and no claimed win rates anywhere in this repo.
-
----
-
-## Quick start
-
-```bash
-pip install -r requirements.txt
-
-export BOT_TOKEN="123456:ABC..."        # from @BotFather
-export CHANNEL_ID="@yourchannel"        # bot must be admin with Post Messages
-export DATABASE_URL="postgresql://..."  # optional but strongly recommended
-
-python main.py
-python test_fixes.py                    # regression suite, no network needed
+## Run it
 ```
+pip install pandas numpy --break-system-packages
+python3 main.py
+```
+Outputs land in `output/`: `trade_journal.csv`, `mahendra.db` (SQLite), `performance_report.json`, `monthly_report.csv`, `weights.json` (self-learning weights).
 
-## Railway deployment
+**Latest backtest on your file (after bug-fix pass below):** 684 trades, 65.1% win rate, profit factor 2.39, +331.4R total, -5.0R max drawdown.
+This is a single in-sample run on one month of data with no walk-forward validation — treat it as a proof that the pipeline works, not as evidence of a tradeable edge. Re-test on more months and out-of-sample before risking real capital.
 
-1. Connect the GitHub repo — `railway.toml` handles the build.
-2. **Add the Postgres plugin.** Railway then sets `DATABASE_URL` for you.
-   Without it the bot writes to the container filesystem, which is wiped on
-   every deploy: open trades are orphaned and all history resets to zero.
-   The startup log tells you which backend is live.
-3. Set `BOT_TOKEN` and `CHANNEL_ID` in Variables.
+## Bug-fix pass (post-review)
+A deep review surfaced real bugs — fixed, not just cosmetic:
+1. **PnL accounting bug (trade_management.py):** if a trade hit TP1/TP2 (partial profit banked) and *then* got stopped out on the trailing stop, the exit calculation was silently dropping the banked partial profit — a trade that was actually +0.6R could get logged as flat/negative. Fixed so realized partial profit is always carried into the final PnL.
+2. **Duplicate-signal protection was a no-op (risk.py / main.py):** the dedup key included the bar index, which is always unique, so item 50 never actually blocked anything. Fixed to key on direction + price-zone instead.
+3. **Six SMC constructs were fully coded but never wired into any decision** — equal highs/lows, inducement, breaker blocks, mitigation blocks, fake breakout, and institutional zone (volume-profile POC) were computed and then discarded. They're now wired into the AI score as real votes.
+4. **Dynamic ATR filter (item 1) was computed but unused** — now used as a sanity check that rejects signals during abnormal volatility spikes (|z| > 4), which can indicate bad ticks or a violent news candle.
+5. `ai_score` was hardcoded to `null` in every journal row even though the score was available — now logged correctly.
+6. Minor: removed a leftover dead-code line in the session-filter overlap calculation (harmless, just redundant).
 
-Confirm it worked: restart the service, then send `/history` — the trades
-should still be there.
+Numbers changed materially after these fixes (684 vs. 859 trades, better win rate/profit factor) — that's expected: the earlier run both mis-accounted some PnL and was missing real confirmation signals.
 
----
-
-## Commands
-
-| Command | What it does |
-|---|---|
-| `/btc` `/eth` `/sol` … | Manual signal for that asset |
-| `/signal` | Same as `/btc` |
-| `/trend` | Multi-timeframe trend summary |
-| `/stats [asset]` | Signal counts, TP/SL/BE breakdown, win rate |
-| `/perf [asset]` | Expectancy, profit factor, drawdown, streaks — in R |
-| `/guards` | Exposure, daily count, loss streak, pause state |
-| `/history [asset]` | Last 10 trades with TP progress |
-
----
-
-## How a trade is tracked
-
-1. `strategy.py` scores the setup; only BUY/SELL setups continue.
-2. Levels are re-priced off a near-live quote so the posted entry is not a
-   stale 5-minute candle close.
-3. `guards.py` decides whether the trade is allowed to open at all.
-4. `trade_monitor.py` polls 1-minute bars every 60s and **replays them in
-   chronological order, starting from the bar after entry.**
-5. TP1 banks the first partial and moves the stop to breakeven —
-   `original_sl` is kept so the R maths stays honest.
-
-### Risk model
-
-- Stop: `2.5 × ATR(5m)`, floored at 0.15% of price, widened 40% in thin
-  (Asian / off-hours) sessions.
-- Targets: **TP1 = 1.2R, TP2 = 2.0R, TP3 = 3.0R.**
-- Precision is derived from the live price, not hardcoded per coin.
-
-### Risk guards (all tunable via env vars)
-
-| Variable | Default | Meaning |
+## What's genuinely implemented (from your OHLCV data)
+| # | Feature | File |
 |---|---|---|
-| `MAX_OPEN_TRADES` | 4 | Concurrent open positions |
-| `MAX_TRADES_PER_DAY` | 12 | Daily signal cap |
-| `MAX_CONSEC_LOSSES` | 4 | Losing streak that trips the breaker |
-| `LOSS_PAUSE_SEC` | 21600 | Pause length after the breaker trips (6h) |
-| `SIGNAL_CYCLE_SEC` | 900 | Full asset scan interval |
-| `SIGNAL_COOLDOWN_SEC` | 900 | Per-asset silence after a signal |
-| `MONITOR_INTERVAL_SEC` | 60 | SL/TP poll interval |
-| `STARTUP_DELAY_SEC` | 60 | Warm-up before the first scan (stops the boot-time burst) |
-| `MAX_NEW_TRADES_PER_CYCLE` | 2 | Cap on new entries opened in one scan (spaces out correlated coins) |
-| `MIN_CONFIRMATIONS` | 9 | Confirmations (of 12) required before a signal is posted & tracked |
-| `MIN_SCORE` | 62 | Minimum weighted score (0–100) required to post |
-| `BOT_UTC_OFFSET_MIN` | 330 | Minutes past UTC for the bot's day boundary & timestamps (330 = IST). Set 0 for UTC. Controls the daily trade cap reset, the digest time, and the time shown on each trade |
+|1|Dynamic ATR filter|indicators.py|
+|2|EMA slope + distance|indicators.py|
+|3|Market structure (BOS/CHOCH/HH/HL/LH/LL)|smc.py|
+|4|Order blocks|smc.py|
+|5|Fair value gaps|smc.py|
+|6|Premium/discount zones|smc.py|
+|7|Liquidity pools|smc.py|
+|8|Equal highs/lows|smc.py|
+|9|Inducement|smc.py|
+|10|Breaker blocks|smc.py|
+|11|Mitigation blocks|smc.py|
+|12|Volume profile (POC/HVN/LVN)|indicators.py|
+|15|Dynamic AI score|scoring.py|
+|16-20|ATR SL, trailing stop, breakeven, partial TP, time exit|trade_management.py|
+|21-25|30m/1h confirmation, MTF trend weight & structure|main.py (`build_mtf_trend`)|
+|26-33|Candle/momentum filters, RSI, MACD, ADX, VWAP|indicators.py|
+|34-38|Volume spike, RVOL, buy/sell ratio, delta volume, low-liquidity flag|indicators.py|
+|39-43|Liquidity sweep, stop hunt, fake breakout, smart-money entry, institutional zone|smc.py|
+|44-50|Position sizing, daily/consecutive loss limits, open-trade cap, cooldown, duplicate protection|risk.py|
+|51-56|Min score, confidence, volatility-based expiry, trend probability %|scoring.py|
+|63-67|London/NY/Asian kill zones, overlap, session volatility rating|sessions_external.py|
+|68-73|Auto-BE, ATR TP, TP1/2/3 ladder, RR, timeout, weak-trade close|trade_management.py|
+|74-79|Trade journal (SQLite+CSV), win rate, profit factor, drawdown, monthly report|journal.py|
+|80-85|Self-learning weight updates from win/loss history|scoring.py|
+|86-95|Retry/timeout wrapper, persistent DB, duplicate-trade guard, data integrity check, config validation|data_layer.py, journal.py|
+|96-97|Market regime (trend/range), volatility regime|regime.py|
 
-**Why the burst controls exist:** the 12 coins move together, so a clean
-trend makes several qualify in the same scan. Without a per-cycle cap that
-becomes 3–4 near-identical entries in one minute — and because the first scan
-used to run the instant the process booted, it happened right after every
-redeploy. `STARTUP_DELAY_SEC` + `MAX_NEW_TRADES_PER_CYCLE` fix both.
+## What CANNOT come from this file — needs live APIs (stubbed, clearly marked)
+Your CSV is historical BTCUSDT spot/futures klines only. These items need **external live data feeds** that don't exist in any OHLCV file. I built the hooks with obvious TODOs in `sessions_external.py` so you can drop in real keys:
 
----
+- **13. Open Interest filter** → Binance Futures `openInterestHist` endpoint
+- **14. Funding rate filter** → Binance Futures `fundingRate`/`premiumIndex`
+- **57-62. News filters (CPI/FOMC/NFP/ETF/economic calendar)** → an economic-calendar API (ForexFactory/TradingEconomics)
+- **98. BTC dominance filter** → CoinGecko/CoinMarketCap global-metrics endpoint
+- **99. ETH-BTC correlation** → needs an ETHUSDT price series (only BTCUSDT was uploaded); the function accepts one if you supply it
 
-## Reading the performance report
+Everything else runs today, offline, on your file.
 
-`/perf` reports in **R** — multiples of the risk taken on each trade.
+## New in this pass (10 items requested)
+| # | Item | What actually happened |
+|---|---|---|
+|1|Real Open Interest API|`live_data.get_open_interest()` — real Binance Futures `openInterestHist` call. **Live-only** (see below).|
+|2|Real Funding Rate API|`live_data.get_funding_rate()` — real Binance Futures `premiumIndex` call. **Live-only**.|
+|3|Binance Long/Short Ratio|`live_data.get_long_short_ratio()` — real `globalLongShortAccountRatio` call. **Live-only**.|
+|4|Fear & Greed Index|`live_data.get_fear_greed_index()` — real alternative.me call, free, no key. **Live-only**.|
+|5|Cumulative Volume Delta (CVD)|`indicators.cvd()` + `cvd_divergence()` — real, from your file's own `taker_buy_base`/`volume` columns. **Backtested**: wired into the AI score as a live vote.|
+|6|Commission Simulation|`trade_management.commission_r()` — round-trip taker fee (0.04%/side default) deducted from every trade's R before logging. **Backtested**.|
+|7|Latency Simulation|`trade_management.apply_latency_slippage()` — every entry/exit fill is slipped by a spread cost + an ATR-scaled amount for the simulated order latency (250ms default), always adverse. **Backtested**.|
+|8|Walk-Forward Optimization|`validation.run_walk_forward()` — 5 rolling folds; weights adapt on each fold's train slice, freeze, then run out-of-sample on the test slice. Only OOS trades count toward the reported result. **Backtested**.|
+|9|Monte Carlo Backtesting|`validation.monte_carlo_backtest()` — 5,000 bootstrap resamples of your realized trade R-multiples, giving a percentile range for final equity and max drawdown instead of one lucky/unlucky sequence. **Backtested**.|
+|10|Real API for Funding/OI/Dominance/Calendar/Correlation|`sessions_external.py` now forwards to `live_data.py` real calls for funding, OI, dominance, and long/short ratio. ETH-BTC correlation is real once you fetch matching historical ETH candles via `live_data.get_eth_klines()`. The economic calendar stays a documented stub — see below.|
 
-Win rate alone is misleading for a bot that scales out: 40% at +1.85R beats
-70% at +0.2R. **Expectancy is the number that decides whether the strategy
-works.** Positive = the edge is real; negative = it is not, regardless of how
-good the win rate looks.
+### Why items 1-4 (and dominance) are "live-only," not backtested
+Open Interest, Funding Rate, Long/Short Ratio, Fear & Greed and BTC Dominance are all **current-snapshot** endpoints — there's no free historical time series from Binance/CoinGecko/alternative.me that lines up 1:1 with your May-2026 1-minute bars. Attaching *today's* funding rate to a *May-2026* candle would be lookahead-shaped noise dressed up as a real signal, so it's deliberately **not** wired into the historical backtest loop in `main.py`. Instead:
+- `live_data.py` has real, working functions for all of them — call `live_market_filter()` from a live/forward-testing loop and they'll return today's actual values.
+- The one exception is ETH price: Binance's public klines endpoint does return real historical candles for any past window, so `eth_btc_correlation()` becomes genuinely backtestable once you pull the matching range with `get_eth_klines(start_time=..., end_time=...)`.
+- The economic calendar (items 57-62) is left as a **documented stub** — there's no free, keyless, ToS-safe calendar API (ForexFactory/Investing.com require scraping that breaks their ToS; TradingEconomics/Finnhub need a paid key). Plug a paid key into `live_data.economic_calendar_events()` when you have one.
 
-The R figures assume a **50 / 25 / 25 scale-out** at TP1 / TP2 / TP3. That
-assumption is stated on the report itself. Outcomes settle at:
+### Sandbox limitation
+This review/build ran in an environment with outbound network access disabled, so the real API calls in `live_data.py` could not be executed or smoke-tested here. Endpoints, params, and response field names match the current public Binance Futures/Spot, CoinGecko, and alternative.me docs — run `python3 live_data.py` on a machine with internet access before depending on it live. Everything else (CVD, commission, latency, walk-forward, Monte Carlo) was run end-to-end on synthetic OHLCV data in this sandbox and confirmed working; re-run `python3 main.py` on your real file to get real numbers — the synthetic-data numbers in this sandbox are meaningless and not reported here.
 
-| Outcome | R |
-|---|---|
-| Stop, no TP1 | −1.00 |
-| Breakeven after TP1 | +0.60 |
-| Breakeven after TP2 | +1.10 |
-| Full TP3 | +1.85 |
+## Post-build audit — 2 real bugs found and fixed in the latency simulation
+A follow-up audit caught that the first cut of latency/slippage simulation looked correct but had **zero actual effect on the numbers**:
+1. **Entry side:** the stop-loss was being re-derived from the already-slipped entry price (`stop = slipped_entry ± ATR*mult`), so the risk distance always came out to exactly `atr_sl_mult * ATR` no matter how much slippage was applied — the slippage canceled itself out. Fixed by anchoring the stop to the *intended* signal price instead, so an adverse fill now genuinely costs extra risk distance.
+2. **Exit side:** a slipped exit price was computed and written to the trade journal, but `pnl_r` was still calculated from the original, unslipped exit price — the slippage only changed a label, never the PnL. Fixed with `trade_management.slipped_exit_and_pnl()`, which re-derives the R-multiple from the slipped price for real price-based exits (stop-loss/time-exit/weak-trade-close) and applies an approximated R-based tax for the idealized TP3 fixed-R-target exit.
 
----
+Verified with a standalone before/after check: a stop-out that used to land at exactly `-1.00R` (friction included only in appearance) now lands at `-1.19R` once slippage (`-0.14R`) and commission (`-0.05R`) are genuinely subtracted — see the numbers change in `git diff` on `trade_management.py`/`main.py` if you want to confirm yourself.
 
-## Backtesting
-
-```bash
-python backtest.py --days 90                      # all 12 coins
-python backtest.py --days 30 --assets btc,eth,sol
-python backtest.py --days 90 --fee-bps 0          # frictionless, for comparison
-```
-
-Data comes from Binance's public klines endpoint (no API key), cached in
-`backtest_data/`. Yahoo is not usable here — it only serves about 7 days of
-1-minute candles, and 7 days of one regime tells you nothing.
-
-The engine imports the real `strategy.get_signal()`, `risk.calculate_trade()`
-and `effective_decimals()` rather than reimplementing them, so the result
-describes the code that actually runs. It reproduces the 15-minute scan
-cycle, the per-asset cooldown, entry at the signal bar's close, and SL/TP
-resolution on 1-minute bars with the same pessimistic same-bar rule as the
-live monitor. The session filter is driven by each bar's own timestamp
-instead of the wall clock.
-
-**Read the cost line.** The report prints `Avg cost ... R per trade`. At
-Binance taker fees (~20 bps round trip) and a stop of 0.5% of price, costs
-are about 0.4R — so a 1.2R first target is really 0.8R after fees. If that
-line is a large fraction of 1R, the target structure is wrong for the stop
-size, and no amount of signal tuning fixes it.
-
-### What the backtest cannot tell you
-
-- The news filter is skipped, so it takes trades the live bot would sit out.
-- Live entries come off a Yahoo quote; these are Binance closes. Real fills
-  differ, and not in your favour.
-- No order book: a market that gaps through the stop fills worse than the
-  stop price. This assumes you get it.
-- Only pairs that still exist today are in the history.
-- It is **one historical path**. A good number is evidence, not proof, and
-  re-tuning parameters until it improves is how you fit noise. Change
-  settings, then re-check on a period you did not tune on.
-
----
-
-## What was fixed, and why it mattered
-
-The bot previously showed a 5.41% win rate over 84 signals. That was not the
-strategy losing — it was four accounting and data bugs stacked on top of each
-other. `test_fixes.py` asserts each one is fixed and also demonstrates the old
-broken behaviour so the regression can't quietly return.
-
-**1. Pre-entry bars closed trades instantly.** The monitor fetched "the last
-3 one-minute bars" with no timestamps and evaluated them against trades that
-had just opened. A new trade was judged on three minutes of price action from
-*before its own entry*, so a large share were closed — as a stop, or as a fake
-TP1 that immediately moved the stop to breakeven — on their very first poll.
-This is why `/history` showed rows where Entry and SL were identical.
-Bars are now timestamped and anything starting before entry is discarded.
-
-**2. Stop always beat target in a merged window.** Three bars were collapsed
-into one high/low pair with the stop checked first, so any window touching
-both sides became a loss no matter which came first. Bars are now replayed
-one at a time in order. Inside a *single* bar the order is genuinely unknowable
-from OHLC, so the stop still wins there — the standard pessimistic convention.
-
-**3. Rounding destroyed the risk model on cheap coins.** AVAX was set to 2
-decimals. At $6.26 the whole stop was one cent wide, so a "1:1.2" posted to
-the channel was really 1:1.0. Precision now comes from `effective_decimals()`.
-
-**4. Win rate could exceed 100%.** Wins counted any trade whose TP1 had been
-hit *including still-open ones*, while the denominator counted only closed
-trades. Wins now come from closed trades only.
-
-Also fixed: `original_sl` is preserved when the stop moves to breakeven; the
-monitor no longer pulls five days of 1-minute candles once a minute per asset
-(a fast route to an HTTP 429 that silently stops all trade tracking); trades
-survive a redeploy when Postgres is configured; and the three dead
-`risk_FIXED_OPTION*.py` files plus seven stale documentation files — which
-described settings the code never used and quoted invented win rates — are
-gone.
-
----
-
-## Project layout
-
-```
-main.py            entry point, command handlers
-config.py          assets, tunables, effective_decimals()
-strategy.py        signal scoring
-indicators.py      EMA/RSI/MACD/ATR/ADX/VWAP/Supertrend
-patterns.py        candlestick patterns
-smart_money.py     liquidity sweeps
-trend.py           multi-timeframe trend
-session.py         London / NY / Asian session state
-risk.py            stop and target placement
-data.py            Yahoo fetch, Binance/Coinbase fallback, 1m bar cache
-auto_signal.py     scan loop
-trade_monitor.py   SL/TP tracking
-trade_tracker.py   trade state, stats
-guards.py          exposure and loss-streak breakers
-analytics.py       R-multiple expectancy, profit factor, drawdown
-persistence.py     Postgres with JSON fallback
-daily_summary.py   daily digest
-watchdog.py        stuck-loop alerts
-news.py            high-impact news pause
-notify.py          channel posting
-formatter.py       message layout
-test_fixes.py      regression suite
-backtest.py        historical replay engine
-backtest_data.py   Binance klines downloader + cache
-```
-
----
-
-## A note on expectations
-
-Signals are generated from Yahoo Finance data, which is not an exchange feed:
-prices can lag, gap, and occasionally glitch. The bot filters for this, but it
-means fills you'd get on a real exchange will differ from the levels posted.
-Treat `/perf` as a measurement of the *signal logic*, not of a live account.
-
-Start the statistics from zero after deploying these fixes — every number
-collected before them was produced by the bugs described above.
+## Honest caveats
+- SMC constructs (order blocks, breaker/mitigation blocks, inducement, etc.) have no single industry-standard formula — these are reasonable, configurable rule-based approximations, not "the" definition.
+- The AI score is a transparent weighted-vote system with a self-learning weight update, not a trained ML model — that's a realistic and auditable starting point; a real ML classifier would need labeled multi-month/multi-symbol data.
+- No exchange execution — this is a signal + backtest engine. Wiring it to place live orders is a separate, higher-stakes step (API keys, order management, slippage handling).

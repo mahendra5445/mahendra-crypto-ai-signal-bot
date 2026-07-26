@@ -1,83 +1,75 @@
 """
-Risk model: ATR-based stop, targets built off the risk distance so the
-posted risk-reward is always the real one.
+risk.py
+Items 44-50: risk management.
 """
-
-import math
-
-from config import MIN_RISK_PCT
-
-# Targets as multiples of the risk distance (R).
-TP1_R = 1.2
-TP2_R = 2.0
-TP3_R = 3.0
-
-ATR_MULT = 2.5          # stop = 2.5 x ATR(5m)
-ASIAN_WIDEN = 1.4       # widen stop + floor by 40% in thin sessions
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 
 
-def calculate_trade(signal, price, atr, decimals=2, session_active=True):
-    """
-    `decimals` MUST come from config.effective_decimals(asset, price) —
-    a hardcoded per-coin value silently destroys the risk model on
-    low-priced coins (a $6 coin at 2 decimals gets a one-cent stop, so a
-    1.2R target rounds to exactly 1.0R).
+@dataclass
+class RiskConfig:
+    account_balance: float = 1000.0
+    risk_per_trade_pct: float = 1.0       # item 45
+    max_daily_loss_pct: float = 3.0       # item 46
+    max_consecutive_losses: int = 3       # item 47
+    max_open_trades: int = 1              # item 48
+    cooldown_minutes: int = 15            # item 49
 
-    `session_active` — True for London/New York, False for Asian/Off-Hours.
-    Thin sessions get a wider stop: same ATR, wider real spread and noisier
-    wicks, so a stop sized for London liquidity gets tagged by noise alone.
-    """
 
-    if signal not in ("BUY", "SELL"):
-        return {
-            "entry": None, "sl": None, "tp1": None, "tp2": None, "tp3": None,
-            "risk_distance": None, "risk_reward": "-",
-        }
+@dataclass
+class RiskState:
+    daily_pnl_pct: float = 0.0
+    consecutive_losses: int = 0
+    open_trades: int = 0
+    last_trade_time: datetime = None
+    last_signal_key: str = None           # item 50: duplicate signal protection
+    current_day: str = None
 
-    entry = round(price, decimals)
 
-    session_factor = 1.0 if session_active else ASIAN_WIDEN
-    sl_mult = ATR_MULT * session_factor
+class RiskManager:
+    def __init__(self, cfg: RiskConfig):
+        self.cfg = cfg
+        self.state = RiskState()
 
-    # ATR arrives as NaN if upstream data had a gap. `nan <= 0` is False in
-    # Python, so an unguarded NaN would flow straight through and turn every
-    # SL/TP in the Telegram message into "nan".
-    if atr is None or (isinstance(atr, float) and math.isnan(atr)):
-        atr = 0
+    def _roll_day(self, ts: datetime):
+        day = ts.strftime("%Y-%m-%d")
+        if self.state.current_day != day:
+            self.state.current_day = day
+            self.state.daily_pnl_pct = 0.0
+            self.state.consecutive_losses = 0  # reset daily; adjust if you want it persistent
 
-    risk = round(atr * sl_mult, decimals)
+    def position_size(self, entry: float, stop_loss: float) -> float:
+        """Item 44/45: Dynamic, risk-based position size (in base asset units)."""
+        risk_amount = self.cfg.account_balance * (self.cfg.risk_per_trade_pct / 100)
+        stop_distance = abs(entry - stop_loss)
+        if stop_distance <= 0:
+            return 0.0
+        return round(risk_amount / stop_distance, 6)
 
-    # Floor the stop at MIN_RISK_PCT of price so a quiet market can't produce
-    # a stop that sits inside normal spread and noise.
-    min_risk = round(price * MIN_RISK_PCT * session_factor, decimals)
-    if risk < min_risk:
-        risk = min_risk
+    def can_trade(self, ts: datetime, signal_key: str) -> tuple[bool, str]:
+        self._roll_day(ts)
+        if self.state.daily_pnl_pct <= -abs(self.cfg.max_daily_loss_pct):
+            return False, "max_daily_loss_hit"
+        if self.state.consecutive_losses >= self.cfg.max_consecutive_losses:
+            return False, "max_consecutive_losses_hit"
+        if self.state.open_trades >= self.cfg.max_open_trades:
+            return False, "max_open_trades_reached"
+        if self.state.last_trade_time is not None:
+            if ts - self.state.last_trade_time < timedelta(minutes=self.cfg.cooldown_minutes):
+                return False, "cooldown_active"
+        if signal_key == self.state.last_signal_key:
+            return False, "duplicate_signal"
+        return True, "ok"
 
-    tp1_reward = risk * TP1_R
-    tp2_reward = risk * TP2_R
-    tp3_reward = risk * TP3_R
+    def register_trade_open(self, ts: datetime, signal_key: str):
+        self.state.open_trades += 1
+        self.state.last_trade_time = ts
+        self.state.last_signal_key = signal_key
 
-    if signal == "BUY":
-        sl  = round(entry - risk, decimals)
-        tp1 = round(entry + tp1_reward, decimals)
-        tp2 = round(entry + tp2_reward, decimals)
-        tp3 = round(entry + tp3_reward, decimals)
-    else:
-        sl  = round(entry + risk, decimals)
-        tp1 = round(entry - tp1_reward, decimals)
-        tp2 = round(entry - tp2_reward, decimals)
-        tp3 = round(entry - tp3_reward, decimals)
-
-    actual_risk   = abs(entry - sl)
-    actual_reward = abs(tp1 - entry)
-    rr = round(actual_reward / actual_risk, 2) if actual_risk > 0 else 0
-
-    return {
-        "entry": entry,
-        "sl": sl,
-        "tp1": tp1,
-        "tp2": tp2,
-        "tp3": tp3,
-        "risk_distance": actual_risk,
-        "risk_reward": f"1:{rr}",
-    }
+    def register_trade_close(self, pnl_pct: float):
+        self.state.open_trades = max(0, self.state.open_trades - 1)
+        self.state.daily_pnl_pct += pnl_pct
+        if pnl_pct < 0:
+            self.state.consecutive_losses += 1
+        else:
+            self.state.consecutive_losses = 0
