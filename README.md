@@ -16,7 +16,7 @@ pip install -r requirements.txt
 
 export BOT_TOKEN="123456:ABC..."        # from @BotFather
 export CHANNEL_ID="@yourchannel"        # bot must be admin with Post Messages
-export DATABASE_URL="postgresql://..."  # optional but strongly recommended
+export DATABASE_URL="postgresql://..."  # required (local JSON-only: ALLOW_JSON_PERSISTENCE=1)
 
 python main.py
 python test_fixes.py                    # regression suite, no network needed
@@ -24,12 +24,12 @@ python test_fixes.py                    # regression suite, no network needed
 
 ## Railway deployment
 
-1. Connect the GitHub repo — `railway.toml` handles the build.
-2. **Add the Postgres plugin.** Railway then sets `DATABASE_URL` for you.
+1. Connect the GitHub repo — `railway.toml` / `Procfile` set `python main.py`.
+2. **Add the Postgres plugin.** Railway then sets `DATABASE_URL`.
    Without it the bot writes to the container filesystem, which is wiped on
    every deploy: open trades are orphaned and all history resets to zero.
-   The startup log tells you which backend is live.
-3. Set `BOT_TOKEN` and `CHANNEL_ID` in Variables.
+3. Set **required** Variables: `BOT_TOKEN`, `CHANNEL_ID`, `ADMIN_IDS`
+   (comma-separated Telegram user IDs).
 
 Confirm it worked: restart the service, then send `/history` — the trades
 should still be there.

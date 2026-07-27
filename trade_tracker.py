@@ -10,10 +10,11 @@ Every trade now records enough to be audited after the fact:
   exit_price / closed_ts  what actually closed the trade, and when.
 """
 
+import copy
 import logging
 import time
 
-from clock import fmt_ts
+from clock import fmt_ts, today_str
 from persistence import load_trades_from_disk, save_trades_to_disk
 
 logger = logging.getLogger(__name__)
@@ -27,8 +28,25 @@ _trades, _next_id = load_trades_from_disk()
 
 # ── internal helpers ──────────────────────────────────────────────────────
 
-def _persist() -> None:
-    save_trades_to_disk(_trades, _next_id)
+def _persist() -> bool:
+    """Blocking persist — prefer persist_snapshot() from async paths (H-012)."""
+    ok = save_trades_to_disk(_trades, _next_id)
+    if not ok:
+        logger.critical("[TRACKER] Persist failed — in-memory state is NOT durable")
+    return ok
+
+
+def snapshot_state() -> tuple[list, int]:
+    """Deep copy of state for off-lock persistence."""
+    return copy.deepcopy(_trades), _next_id
+
+
+def persist_snapshot(trades: list, next_id: int) -> bool:
+    """Write a previously taken snapshot (safe to call from a worker thread)."""
+    ok = save_trades_to_disk(trades, next_id)
+    if not ok:
+        logger.critical("[TRACKER] Snapshot persist failed — state NOT durable")
+    return ok
 
 
 def _trim_history() -> None:
@@ -63,20 +81,24 @@ def has_open_trade(asset: str) -> bool:
     return any(t["status"] == "OPEN" and t["asset"].lower() == a for t in _trades)
 
 
-def save_trade(result: dict, asset: str = "btc") -> dict | None:
+def save_trade(result: dict, asset: str = "btc", *, persist: bool = True) -> dict | None:
     """
     Persist a new trade from a signal result dict.
     Caller MUST hold shared_state.trade_lock.
+    Set persist=False to mutate only; then call persist_snapshot(snapshot_state()).
     """
     global _next_id
 
     signal = result.get("signal")
     if signal not in ("BUY", "SELL"):
         return None
+    if result.get("entry") is None or result.get("sl") is None:
+        return None
 
     now = time.time()
     entry = float(result["entry"])
     sl    = float(result["sl"])
+    day   = today_str()
 
     trade = {
         "id":          _next_id,
@@ -93,6 +115,7 @@ def save_trade(result: dict, asset: str = "btc") -> dict | None:
         "hit_tp3":     False,
         "status":      "OPEN",
         "opened_ts":   now,
+        "opened_day":  day,
         "closed_ts":   None,
         "exit_price":  None,
         "time":        fmt_ts(now),
@@ -101,7 +124,8 @@ def save_trade(result: dict, asset: str = "btc") -> dict | None:
     _next_id += 1
     _trades.append(trade)
     _trim_history()
-    _persist()
+    if persist:
+        _persist()
 
     logger.info(
         f"[TRADE] Saved #{trade['id']} {asset.upper()} {signal} "
@@ -114,7 +138,9 @@ def get_open_trades() -> list[dict]:
     return [t for t in _trades if t["status"] == "OPEN"]
 
 
-def update_trade(trade_id: int, status: str, exit_price: float | None = None) -> bool:
+def update_trade(
+    trade_id: int, status: str, exit_price: float | None = None, *, persist: bool = True
+) -> bool:
     """
     Close a trade with a final status (TP / SL / BE).
     Caller MUST hold shared_state.trade_lock.
@@ -131,7 +157,8 @@ def update_trade(trade_id: int, status: str, exit_price: float | None = None) ->
         trade["status"]     = status
         trade["closed_ts"]  = time.time()
         trade["exit_price"] = round(float(exit_price), 8) if exit_price is not None else None
-        _persist()
+        if persist:
+            _persist()
         logger.info(f"[TRADE] #{trade_id} closed as {status}")
         return True
 
@@ -139,26 +166,32 @@ def update_trade(trade_id: int, status: str, exit_price: float | None = None) ->
     return False
 
 
-def mark_tp1_hit(trade: dict) -> None:
+def mark_tp1_hit(trade: dict, *, persist: bool = True) -> bool:
     """
     Mark TP1 as hit and move the stop to breakeven.
-
-    BUG FIX: this used to overwrite `sl` with the entry price and keep no
-    record of the real stop. Every later R-multiple, and every "SL" line in
-    /history, then showed the breakeven price as if it had been the original
-    risk. `original_sl` is now preserved.
+    `original_sl` is preserved.
     """
+    if trade.get("status") != "OPEN":
+        return False
+    if trade.get("hit_tp1"):
+        return False
     trade["hit_tp1"] = True
     trade.setdefault("original_sl", trade["sl"])
     trade["sl"] = trade["entry"]
-    _persist()
+    if persist:
+        _persist()
     logger.info(f"[TRADE] #{trade['id']} TP1 hit — SL moved to breakeven")
+    return True
 
 
-def mark_tp2_hit(trade: dict) -> None:
+def mark_tp2_hit(trade: dict, *, persist: bool = True) -> bool:
+    if trade.get("status") != "OPEN":
+        return False
     trade["hit_tp2"] = True
-    _persist()
+    if persist:
+        _persist()
     logger.info(f"[TRADE] #{trade['id']} TP2 hit")
+    return True
 
 
 def find_trade(trade_id: int) -> dict | None:
@@ -179,19 +212,6 @@ def _filtered(asset: str | None = None, since: str | None = None) -> list[dict]:
 
 
 def get_stats(asset: str | None = None, since: str | None = None) -> dict:
-    """
-    Stats derived live from the trade list, so they can never drift out of
-    sync with reality after a restart or a history trim.
-
-    BUG FIX: `wins` used to count any trade whose TP1 had been hit —
-    including trades that were still OPEN — while `closed` counted only
-    settled trades. A day with two running winners and one loss reported a
-    win rate of 200%. Wins are now counted from CLOSED trades only.
-
-    What counts as a win: TP3 (full target), and BE — because a breakeven
-    close can only happen AFTER TP1 was hit, i.e. the first partial was
-    already banked. A stop with no TP1 is the only loss.
-    """
     trades = _filtered(asset, since)
 
     buy  = sum(1 for t in trades if t["signal"] == "BUY")
@@ -241,8 +261,6 @@ def history_text(limit: int = 10, asset: str | None = None) -> str:
         icon = status_icon.get(trade["status"], "❓")
         orig = trade.get("original_sl", trade["sl"])
 
-        # BUG FIX: once TP1 was hit the stop shows the entry price, which made
-        # /history look like a "SL == Entry" bug. Label it for what it is.
         if trade.get("hit_tp1") and trade["sl"] == trade["entry"]:
             sl_line = f"{trade['sl']}  (moved to BE, original {orig})"
         else:

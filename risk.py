@@ -16,6 +16,13 @@ ATR_MULT = 2.5          # stop = 2.5 x ATR(5m)
 ASIAN_WIDEN = 1.4       # widen stop + floor by 40% in thin sessions
 
 
+def _empty_levels():
+    return {
+        "entry": None, "sl": None, "tp1": None, "tp2": None, "tp3": None,
+        "risk_distance": None, "risk_reward": "-",
+    }
+
+
 def calculate_trade(signal, price, atr, decimals=2, session_active=True):
     """
     `decimals` MUST come from config.effective_decimals(asset, price) —
@@ -29,21 +36,16 @@ def calculate_trade(signal, price, atr, decimals=2, session_active=True):
     """
 
     if signal not in ("BUY", "SELL"):
-        return {
-            "entry": None, "sl": None, "tp1": None, "tp2": None, "tp3": None,
-            "risk_distance": None, "risk_reward": "-",
-        }
+        return _empty_levels()
+
+    # M-019: unusable ATR must not silently collapse to the % floor alone.
+    if atr is None or (isinstance(atr, float) and (math.isnan(atr) or atr <= 0)):
+        return _empty_levels()
 
     entry = round(price, decimals)
 
     session_factor = 1.0 if session_active else ASIAN_WIDEN
     sl_mult = ATR_MULT * session_factor
-
-    # ATR arrives as NaN if upstream data had a gap. `nan <= 0` is False in
-    # Python, so an unguarded NaN would flow straight through and turn every
-    # SL/TP in the Telegram message into "nan".
-    if atr is None or (isinstance(atr, float) and math.isnan(atr)):
-        atr = 0
 
     risk = round(atr * sl_mult, decimals)
 

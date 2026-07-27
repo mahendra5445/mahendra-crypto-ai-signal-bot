@@ -8,6 +8,7 @@ enough to retune the bot.
 
 import math
 import os
+import sys
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
@@ -17,10 +18,23 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 # "Post Messages" permission.
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
+# Comma-separated Telegram user IDs allowed to use bot commands.
+# Required in production — empty allowlist refuses all commands.
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
+}
+
 
 def _int_env(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
     except (TypeError, ValueError):
         return default
 
@@ -56,6 +70,10 @@ MAX_NEW_TRADES_PER_CYCLE = _int_env("MAX_NEW_TRADES_PER_CYCLE", 2)
 #                          if you deliberately want more, lower-quality fills.
 MIN_CONFIRMATIONS = _int_env("MIN_CONFIRMATIONS", 9)
 MIN_SCORE         = _int_env("MIN_SCORE", 62)
+
+# Abort auto-entry if live quote drifted more than this fraction from the
+# closed 5m candle the setup was scored on (H-008).
+LIVE_PRICE_DRIFT_MAX = _float_env("LIVE_PRICE_DRIFT_MAX", 0.003)
 
 # ==========================================================================
 # RISK GUARDS  (enforced in guards.py)
@@ -131,3 +149,30 @@ def effective_decimals(asset: str, price: float | None) -> int:
     needed      = math.ceil(-math.log10(tick_needed))
 
     return max(base, min(needed, 8))
+
+
+def require_env() -> None:
+    """
+    Fail closed on missing production essentials (C-005 / L-010 / P-005).
+    BOT_TOKEN and CHANNEL_ID are always required. ADMIN_IDS is required so
+    command handlers are not world-open (C-004). DATABASE_URL is required
+    unless ALLOW_JSON_PERSISTENCE=1 (local/dev only).
+    """
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not CHANNEL_ID:
+        missing.append("CHANNEL_ID")
+    if not ADMIN_IDS:
+        missing.append("ADMIN_IDS")
+    allow_json = os.getenv("ALLOW_JSON_PERSISTENCE", "").strip().lower() in (
+        "1", "true", "yes",
+    )
+    if not allow_json and not os.getenv("DATABASE_URL"):
+        missing.append("DATABASE_URL")
+    if missing:
+        raise SystemExit(
+            f"Missing required env: {', '.join(missing)}. "
+            "Set them in Railway Variables before starting. "
+            "For local JSON-only runs set ALLOW_JSON_PERSISTENCE=1."
+        )

@@ -3,7 +3,7 @@ Trade persistence with two backends.
 
   1. Postgres, when DATABASE_URL is set (Railway sets this automatically the
      moment you add a Postgres plugin to the project).
-  2. Atomic JSON file, otherwise.
+  2. Atomic JSON file, otherwise (local/dev only — see ALLOW_JSON_PERSISTENCE).
 
 WHY THIS MATTERS: Railway's container filesystem is EPHEMERAL. Without a
 volume — and a Trial plan does not get one — every deploy, restart and
@@ -11,10 +11,6 @@ crash wipes the JSON file. That means open trades are orphaned (never
 monitored again, never closed, never reported) and the whole trade history
 resets to zero, which makes every statistic the bot has ever printed
 meaningless. Postgres is the fix; the JSON path stays for local runs.
-
-Storage shape is deliberately simple — one row holding the whole state
-blob. At a 500-trade cap that is a few hundred KB, and it removes any need
-for migrations.
 """
 
 import json
@@ -30,18 +26,26 @@ TRADES_FILE = os.path.join(DATA_DIR, "trades.json")
 
 _STATE_KEY = "trades"
 
+# Set True when Postgres was configured but load/save is failing — operators
+# must not trust durability in that mode.
+persistence_degraded: bool = False
+
 # ── optional Postgres driver ──────────────────────────────────────────────
 _pg = None
+_Json = None
 if DATABASE_URL:
     try:
         import psycopg2  # type: ignore
+        from psycopg2.extras import Json  # type: ignore
         _pg = psycopg2
+        _Json = Json
     except ImportError:
         logger.error(
             "[PERSISTENCE] DATABASE_URL is set but psycopg2 is not installed — "
             "falling back to JSON files (data WILL be lost on redeploy). "
             "Add psycopg2-binary to requirements.txt."
         )
+        persistence_degraded = True
 
 
 def _pg_connect():
@@ -64,18 +68,51 @@ def _pg_init() -> None:
         conn.commit()
 
 
+def _pg_canary() -> None:
+    """Write+read a canary key so we refuse to claim Postgres if JSONB binding is broken."""
+    with _pg_connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO bot_state (key, value, updated_at) "
+            "VALUES (%s, %s, NOW()) "
+            "ON CONFLICT (key) DO UPDATE "
+            "SET value = EXCLUDED.value, updated_at = NOW()",
+            ("__canary__", _Json({"ok": True})),
+        )
+        cur.execute("SELECT value FROM bot_state WHERE key = %s", ("__canary__",))
+        row = cur.fetchone()
+        conn.commit()
+    if not row or not row[0]:
+        raise RuntimeError("Postgres canary read returned empty")
+
+
 _pg_ready = False
-if _pg is not None:
+if _pg is not None and _Json is not None:
     try:
         _pg_init()
+        _pg_canary()
         _pg_ready = True
         logger.info("[PERSISTENCE] Postgres backend ready")
     except Exception as e:
-        logger.error(f"[PERSISTENCE] Postgres init failed ({e}) — using JSON fallback")
+        persistence_degraded = True
+        logger.error(
+            f"[PERSISTENCE] Postgres init/canary failed ({e}) — using JSON fallback "
+            "(NOT durable on Railway)"
+        )
 
 
 def backend_name() -> str:
     return "postgres" if _pg_ready else "json-file"
+
+
+def is_degraded() -> bool:
+    return persistence_degraded or (bool(DATABASE_URL) and not _pg_ready)
+
+
+def postgres_required() -> bool:
+    """Production default: Postgres is required unless explicitly opted out."""
+    return os.getenv("ALLOW_JSON_PERSISTENCE", "").strip().lower() not in (
+        "1", "true", "yes",
+    )
 
 
 # ── load ──────────────────────────────────────────────────────────────────
@@ -106,7 +143,14 @@ def _unpack(data: dict) -> tuple[list, int]:
 
 
 def load_trades_from_disk() -> tuple[list, int]:
-    """Returns (trades_list, next_id). next_id is always > every existing id."""
+    """
+    Returns (trades_list, next_id). next_id is always > every existing id.
+
+    P-001: when Postgres is the active backend, load failures fail closed —
+    never silently replace durable state with ephemeral JSON.
+    """
+    global persistence_degraded
+
     if _pg_ready:
         try:
             with _pg_connect() as conn, conn.cursor() as cur:
@@ -119,7 +163,15 @@ def load_trades_from_disk() -> tuple[list, int]:
             logger.info("[PERSISTENCE] Postgres empty — starting fresh")
             return [], 1
         except Exception as e:
-            logger.error(f"[PERSISTENCE] Postgres load failed ({e}) — trying JSON")
+            persistence_degraded = True
+            logger.critical(
+                f"[PERSISTENCE] Postgres load failed ({e}) — refusing JSON fallback "
+                "to avoid overwriting durable state with empty/ephemeral data"
+            )
+            raise RuntimeError(
+                f"Postgres trade-state load failed: {e}. "
+                "Fix DATABASE_URL / connectivity before starting."
+            ) from e
 
     trades, next_id = _load_json()
     logger.info(f"[PERSISTENCE] Loaded {len(trades)} trades from JSON")
@@ -136,7 +188,14 @@ def _save_json(payload: dict) -> None:
     os.replace(tmp, TRADES_FILE)   # atomic on POSIX
 
 
-def save_trades_to_disk(trades: list, next_id: int) -> None:
+def save_trades_to_disk(trades: list, next_id: int) -> bool:
+    """
+    Persist trade state. Returns True on success, False if no backend saved.
+
+    P-002: callers must check the return value — silent save failure previously
+    left in-memory opens unrecoverable after restart.
+    """
+    global persistence_degraded
     payload = {"next_id": next_id, "trades": trades}
 
     if _pg_ready:
@@ -147,14 +206,24 @@ def save_trades_to_disk(trades: list, next_id: int) -> None:
                     "VALUES (%s, %s, NOW()) "
                     "ON CONFLICT (key) DO UPDATE "
                     "SET value = EXCLUDED.value, updated_at = NOW()",
-                    (_STATE_KEY, json.dumps(payload)),
+                    (_STATE_KEY, _Json(payload)),
                 )
                 conn.commit()
-            return
+            return True
         except Exception as e:
-            logger.error(f"[PERSISTENCE] Postgres save failed ({e}) — writing JSON instead")
+            persistence_degraded = True
+            logger.critical(
+                f"[PERSISTENCE] Postgres save failed ({e}) — "
+                "JSON fallback is NOT durable on Railway"
+            )
+            # When Postgres is required, do not pretend JSON saved durably.
+            if postgres_required():
+                return False
 
     try:
         _save_json(payload)
+        return True
     except Exception as e:
+        persistence_degraded = True
         logger.error(f"[PERSISTENCE] Save trades error: {e}")
+        return False

@@ -38,30 +38,14 @@ W_RSI = 9
 W_VOLUME = 9
 W_ATR = 4
 W_MTF = 14
+# H-006: liquidity demoted to info-only — weight no longer applied in score_side.
+# Kept as a named constant for documentation / future opt-in only.
 W_LIQUIDITY = 9
 
 # MIN_SCORE and MIN_CONFIRMATIONS now come from config.py (env-tunable).
-# Default MIN_CONFIRMATIONS is 9 of 12: a 9-confirmation setup is flagged
-# "Reduced Risk - Half Size" (see position_sizing below) so quality is still
-# visible, while the weaker 8/12 "Quarter Size" tier no longer auto-posts.
+# Default MIN_CONFIRMATIONS is 9. Countable confirmations are 9 (no volume)
+# or 11 (with volume); liquidity is informational only (H-005 / H-006).
 SIGNAL_VALID_MINUTES = 8
-
-STRICT_BULL = {"Strong Bullish", "Bullish"}
-STRICT_BEAR = {"Strong Bearish", "Bearish"}
-
-
-def confidence_label(score):
-    if score >= 90:
-        return "Excellent"
-    elif score >= 80:
-        return "Very Strong"
-    elif score >= 70:
-        return "Strong"
-    elif score >= 60:
-        return "Good"
-    elif score >= 50:
-        return "Average"
-    return "Weak"
 
 
 def _empty_result(reason="Not enough candles"):
@@ -109,6 +93,12 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
 
     if close is None or len(close) < 200:
         return _empty_result()
+
+    # M-020: each MTF series needs enough bars for EMA200 inside get_trend
+    for tf_name in ("1m", "5m", "15m"):
+        series = (timeframes or {}).get(tf_name) or []
+        if len(series) < 200:
+            return _empty_result(f"Not enough {tf_name} candles")
 
     price = round(close[-1], decimals)
 
@@ -193,30 +183,24 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
     # ==========================
     # 9. VOLUME FILTER (current >= 85% of 20-candle average)
     # ==========================
-    # Default True: if we have no reliable volume data (common for spot
-    # forex/gold tickers), we can't fail the check - treat as "not
-    # applicable" rather than penalizing the signal for missing data
-    volume_ok = True
-    if volume and len(volume) >= 20 and sum(volume[-20:]) > 0:
+    # H-005 / H-017: missing volume must NOT auto-pass. When volume data is
+    # absent, volume checks are excluded from the confirmation denominator
+    # and from score weight (Option B).
+    volume_data_ok = bool(volume and len(volume) >= 20 and sum(volume[-20:]) > 0)
+    volume_ok = False
+    volume_spike_ok = False
+    if volume_data_ok:
         recent_avg = sum(volume[-20:-1]) / len(volume[-20:-1])
         current_vol = volume[-1]
         volume_ok = recent_avg > 0 and current_vol >= recent_avg * 0.85
+        # Keep 1.05 threshold when volume exists — preserves prior strategy
+        # for assets that do report volume.
+        volume_spike_ok = recent_avg > 0 and current_vol >= recent_avg * 1.05
 
     # ==========================
     # 10. ATR FILTER (scoring bonus only, not a hard gate)
     # ==========================
     atr_ok = bool(atr_ma_value) and atr_value > atr_ma_value
-
-    # ==========================
-    # NEW: VOLUME SPIKE FILTER (हल्का/light - mild spike, not a strict one)
-    # Current volume should be at least ~15% above its own recent average.
-    # Same "no data -> pass" fallback as the base volume filter above.
-    # ==========================
-    volume_spike_ok = True
-    if volume and len(volume) >= 20 and sum(volume[-20:]) > 0:
-        spike_avg = sum(volume[-20:-1]) / len(volume[-20:-1])
-        spike_current = volume[-1]
-        volume_spike_ok = spike_avg > 0 and spike_current >= spike_avg * 1.05
 
     # ==========================
     # NEW: CANDLE CONFIRMATION
@@ -233,22 +217,14 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
         candle_bear_ok = last_close < last_open
 
     # ==========================
-    # 12. LIQUIDITY FILTER (avoid fake breakouts / raw sweep entries)
+    # 12. LIQUIDITY — informational only (H-006)
     # ==========================
-    # BUG FIX: this used to be just `not smc["fake_breakout"]`.
-    # fake_breakout only fires in one narrow combo (liquidity sweep AND a
-    # BOS in the opposite direction that then closes back inside range),
-    # so in practice this check passed almost every single time and the
-    # "No Fake Breakout / Clean Liquidity" confirmation wasn't really
-    # filtering anything. Added a second condition: a liquidity sweep with
-    # NO break-of-structure follow-through at all (classic stop-hunt
-    # pattern - price grabs stops beyond the recent high/low then just
-    # sits there with no real structural break) also fails the check.
+    # Still computed for display / reasons context, but no longer a scored
+    # confirmation or free +W_LIQUIDITY points.
     liquidity_ok = not smc["fake_breakout"] and not (smc["liquidity"] and not smc["bos"])
 
     # ==========================
     # 14. SESSION FILTER - info only now, not a hard gate
-    # (BTC trades 24/7 and this was cutting too many valid gold setups)
     # ==========================
     session_ok = True
 
@@ -263,10 +239,11 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
         s += W_VWAP if (vwap_bull if is_bull else vwap_bear) else 0
         s += W_MACD if (macd_bull if is_bull else macd_bear) else 0
         s += W_RSI if (rsi_bull if is_bull else rsi_bear) else 0
-        s += W_VOLUME if volume_ok else 0
+        if volume_data_ok:
+            s += W_VOLUME if volume_ok else 0
         s += W_ATR if atr_ok else 0
         s += W_MTF if (mtf_bull if is_bull else mtf_bear) else 0
-        s += W_LIQUIDITY if liquidity_ok else 0
+        # liquidity weight intentionally omitted (H-006)
         return s
 
     buy_score = score_side(True)
@@ -303,16 +280,20 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
     buy_score = max(0, min(buy_score, 100))
     sell_score = max(0, min(sell_score, 100))
 
-    buy_confirmations = sum([
+    buy_confirmations_parts = [
         ema_bull, adx_ok, st_bull, vwap_bull, macd_bull,
-        rsi_bull, volume_ok, atr_ok, mtf_bull, liquidity_ok,
-        volume_spike_ok, candle_bull_ok,
-    ])
-    sell_confirmations = sum([
+        rsi_bull, atr_ok, mtf_bull, candle_bull_ok,
+    ]
+    sell_confirmations_parts = [
         ema_bear, adx_ok, st_bear, vwap_bear, macd_bear,
-        rsi_bear, volume_ok, atr_ok, mtf_bear, liquidity_ok,
-        volume_spike_ok, candle_bear_ok,
-    ])
+        rsi_bear, atr_ok, mtf_bear, candle_bear_ok,
+    ]
+    if volume_data_ok:
+        buy_confirmations_parts.extend([volume_ok, volume_spike_ok])
+        sell_confirmations_parts.extend([volume_ok, volume_spike_ok])
+
+    buy_confirmations = sum(buy_confirmations_parts)
+    sell_confirmations = sum(sell_confirmations_parts)
 
     # ==========================
     # 17. FINAL CONFIRMATION
@@ -340,39 +321,63 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
             (rsi_bull if is_bull else rsi_bear, f"RSI Healthy ({rsi_value})"),
             (mtf_bull if is_bull else mtf_bear,
              "MTF Bullish Alignment" if is_bull else "MTF Bearish Alignment"),
-            (volume_ok, "Volume OK"),
             (atr_ok, "ATR Expansion"),
-            (volume_spike_ok, "Volume Spike"),
             (candle_bull_ok if is_bull else candle_bear_ok,
              "Bullish Candle Confirmed" if is_bull else "Bearish Candle Confirmed"),
-            (liquidity_ok, "No Fake Breakout / Clean Liquidity"),
         ]
+        if volume_data_ok:
+            checks.append((volume_ok, "Volume OK"))
+            checks.append((volume_spike_ok, "Volume Spike"))
+        # Liquidity is informational only (H-006)
+        if liquidity_ok:
+            checks.append((True, "Liquidity clean (info)"))
+        elif smc["fake_breakout"] or (smc["liquidity"] and not smc["bos"]):
+            checks.append((True, "Liquidity caution (info only — not gated)"))
         return [label for ok, label in checks if ok]
 
     reasons = []
     final_signal = "NO TRADE"
 
-    if buy_all_true and buy_score >= MIN_SCORE:
+    buy_ready = buy_all_true and buy_score >= MIN_SCORE
+    sell_ready = sell_all_true and sell_score >= MIN_SCORE
+
+    # H-009: no systematic BUY bias when both sides qualify
+    if buy_ready and sell_ready:
+        if buy_score > sell_score:
+            final_signal = "BUY"
+            reasons = build_reasons(True)
+        elif sell_score > buy_score:
+            final_signal = "SELL"
+            reasons = build_reasons(False)
+        else:
+            final_signal = "NO TRADE"
+            reasons = ["NO TRADE - BUY and SELL tied"]
+    elif buy_ready:
         final_signal = "BUY"
         reasons = build_reasons(True)
-    elif sell_all_true and sell_score >= MIN_SCORE:
+    elif sell_ready:
         final_signal = "SELL"
         reasons = build_reasons(False)
     else:
         checklist_bull = {
             "EMA": ema_bull, "ADX": adx_ok, "Supertrend": st_bull,
             "VWAP": vwap_bull, "RSI": rsi_bull, "MACD": macd_bull,
-            "MTF": mtf_bull, "Volume": volume_ok, "ATR": atr_ok,
-            "Liquidity": liquidity_ok, "Session": session_ok,
-            "Volume Spike": volume_spike_ok, "Candle Confirm": candle_bull_ok,
+            "MTF": mtf_bull, "ATR": atr_ok,
+            "Session": session_ok,
+            "Candle Confirm": candle_bull_ok,
         }
         checklist_bear = {
             "EMA": ema_bear, "ADX": adx_ok, "Supertrend": st_bear,
             "VWAP": vwap_bear, "RSI": rsi_bear, "MACD": macd_bear,
-            "MTF": mtf_bear, "Volume": volume_ok, "ATR": atr_ok,
-            "Liquidity": liquidity_ok, "Session": session_ok,
-            "Volume Spike": volume_spike_ok, "Candle Confirm": candle_bear_ok,
+            "MTF": mtf_bear, "ATR": atr_ok,
+            "Session": session_ok,
+            "Candle Confirm": candle_bear_ok,
         }
+        if volume_data_ok:
+            checklist_bull["Volume"] = volume_ok
+            checklist_bull["Volume Spike"] = volume_spike_ok
+            checklist_bear["Volume"] = volume_ok
+            checklist_bear["Volume Spike"] = volume_spike_ok
         checklist = checklist_bull if buy_score >= sell_score else checklist_bear
         failed = [k for k, v in checklist.items() if not v]
         reasons = [f"NO TRADE - failed: {', '.join(failed)}"] if failed else ["NO TRADE - score below threshold"]
@@ -465,7 +470,11 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
         "trend_5m": trend5,
         "trend_15m": trend15,
         "trend_strength": trend_power,
-        "ema_ok": ema_bull or ema_bear,
+        "ema_ok": (
+            ema_bull if final_signal == "BUY"
+            else ema_bear if final_signal == "SELL"
+            else (ema_bull or ema_bear)
+        ),
         "adx_ok": adx_ok,
         "vwap_ok": vwap_bear if final_signal == "SELL" else vwap_bull,
         "supertrend_ok": st_bear if final_signal == "SELL" else st_bull,

@@ -19,6 +19,7 @@ Fixes applied:
 """
 
 import logging
+import os
 import time as _time
 
 import requests
@@ -39,9 +40,9 @@ YF_HEADERS = {
 _YF_INTERVAL = {"1min": "1m", "5min": "5m", "15min": "15m"}
 _YF_RANGE    = {"1min": "5d", "5min": "5d", "15min": "5d"}
 
-# Log a warning (but don't block the signal) when the newest closed
-# candle is older than this many hours.
-MAX_STALE_H = 8
+# Hard-fail when the newest closed candle is older than this (C-002).
+# Crypto trades 24/7 — 30 minutes is already far beyond a usable 5m signal.
+MAX_STALE_H = float(os.getenv("MAX_STALE_H", "0.5"))
 
 # Retry settings
 MAX_RETRIES      = 3
@@ -130,18 +131,18 @@ def _fetch_tf_once(symbol: str, interval_key: str, label: str) -> dict:
     volumes_f = [r[4] for r in rows]
     last_ts   = rows[-1][5]   # unix timestamp of the last closed candle
 
-    # ── Stale-data warning ────────────────────────────────────────────────
+    # ── Stale-data hard fail (C-002) ──────────────────────────────────────
     if last_ts is not None:
         age_h = (_time.time() - last_ts) / 3600
         if age_h > MAX_STALE_H:
-            logger.warning(
-                f"[STALE] {label} {interval_key}: last candle is "
-                f"{age_h:.1f}h old — market may be closed."
+            raise RuntimeError(
+                f"[{label} {interval_key}] STALE DATA: last candle "
+                f"{age_h:.1f}h old (max {MAX_STALE_H}h)"
             )
 
-    # Spot forex/metals tickers report zero volume on Yahoo.
-    # Pass None so strategy knows "no data" rather than "zero volume".
-    if sum(volumes_f) == 0:
+    # H-017: zero volume → explicit missing flag for strategy (do not auto-pass).
+    volume_missing = sum(volumes_f) == 0
+    if volume_missing:
         volumes_f = None
 
     return {
@@ -150,6 +151,7 @@ def _fetch_tf_once(symbol: str, interval_key: str, label: str) -> dict:
         "high":    highs_f,
         "low":     lows_f,
         "volume":  volumes_f,
+        "volume_missing": volume_missing,
         "price":   closes_f[-1],
         "last_ts": last_ts,
     }
@@ -354,6 +356,7 @@ def get_candles(asset: str = "btc") -> dict:
         "high":   tf5["high"],
         "low":    tf5["low"],
         "volume": tf5["volume"],
+        "volume_missing": tf5.get("volume_missing", tf5["volume"] is None),
         "timeframes": {
             "1m":  tf1["close"],
             "5m":  tf5["close"],
@@ -438,13 +441,28 @@ def get_recent_bars(asset: str = "btc", limit: int = 20) -> list[dict] | None:
     def _pull(sym: str) -> list[dict]:
         url    = YF_URL.format(symbol=sym)
         params = {"interval": "1m", "range": "1d"}
-        r = requests.get(url, params=params, headers=YF_HEADERS, timeout=15)
-        r.raise_for_status()
-        payload = r.json()
-        result  = (payload.get("chart", {}) or {}).get("result")
-        if not result:
-            return []
-        return _bars_from_payload(result[0])
+        last_err: Exception | None = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                r = requests.get(url, params=params, headers=YF_HEADERS, timeout=15)
+                r.raise_for_status()
+                payload = r.json()
+                result  = (payload.get("chart", {}) or {}).get("result")
+                if not result:
+                    return []
+                return _bars_from_payload(result[0])
+            except Exception as e:
+                last_err = e
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    logger.warning(
+                        f"[BARS] {a.upper()} attempt {attempt + 1}/{MAX_RETRIES} "
+                        f"failed — retrying in {delay:.0f}s. {e}"
+                    )
+                    _time.sleep(delay)
+        if last_err:
+            raise last_err
+        return []
 
     bars: list[dict] = []
     try:

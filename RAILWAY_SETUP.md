@@ -1,57 +1,50 @@
-# Railway Deploy Guide (Hindi)
+# Railway Deploy Guide
 
-## 1. Project banao
-- Railway dashboard → New Project → Deploy from GitHub repo
-  (ya "Empty Project" + code upload)
+## 1. Create the project
+Railway dashboard → New Project → Deploy from GitHub (or upload this build).
 
-## 2. Environment Variables set karo
-Project → Variables tab mein add karo:
+`railway.toml` / `Procfile` start the bot with: `python main.py`
 
-| Variable   | Value              |
-|------------|--------------------|
-| BOT_TOKEN  | <apna telegram bot token, @BotFather se> |
-| CHANNEL_ID | <apna channel ka @username ya numeric chat id> |
-| DATA_DIR   | /data              |
-| LOG_DIR    | /data/logs         |
+## 2. Required environment variables
 
-## 3. Bot ko channel ka admin banao
-Telegram app mein:
-- Apne channel → Administrators → Add Admin
-- Bot ka username search karke add karo
-- **"Post Messages"** permission zaroor on rakho
+| Variable | Required | Notes |
+|---|---|---|
+| `BOT_TOKEN` | **Yes** | From @BotFather |
+| `CHANNEL_ID` | **Yes** | `@channel` or numeric id; bot must be admin with Post Messages |
+| `ADMIN_IDS` | **Yes** | Comma-separated Telegram user IDs allowed to run commands |
+| `DATABASE_URL` | **Required** | Add the **Postgres** plugin — Railway sets this automatically. Bot refuses to start without it unless `ALLOW_JSON_PERSISTENCE=1` (local only). |
 
-## 4. Volume attach karo (IMPORTANT!)
-Railway ka filesystem bhi ephemeral hai — har deploy/restart pe
-files delete ho jaati hain. Volume ke bina trades.json har baar
-reset ho jayega (open trades ka crash-recovery kaam nahi karega).
+Optional:
 
-- Service pe right-click (ya service settings) → "Attach Volume"
-- Mount path: `/data`
-- Bas — ab DATA_DIR=/data ki wajah se saara data volume pe
-  save hoga aur restarts/deploys pe bacha rahega.
+| Variable | Default | Meaning |
+|---|---|---|
+| `DATA_DIR` | `data` | JSON fallback only (not durable without a volume) |
+| `LOG_DIR` | — | Set only if you mount a volume for file logs |
+| `ENABLE_FILE_LOGS` | off | Set `1` to also write rotating file logs |
+| `BOT_UTC_OFFSET_MIN` | `330` | Day boundary (330 = IST) |
+| `LIVE_PRICE_DRIFT_MAX` | `0.003` | Abort entry if live quote drifts >0.3% from signal bar |
+| `MAX_STALE_H` | `0.5` | Reject candles older than 30 minutes |
 
-Note: Volumes Railway ke Hobby plan ($5/month) pe milte hain.
-Agar volume nahi lagate to bot phir bhi chalega, lekin har
-restart pe trade history reset ho jayegi.
+## 3. Postgres (required for production)
 
-## 5. Deploy
-Push/deploy karo — logs mein yeh dikhna chahiye:
-```
-[INIT] Background tasks started
-🚀 Mahendra Crypto AI Signal starting…
-```
+Add the Railway **Postgres** plugin so `DATABASE_URL` is set.
 
-## 6. Test
-Telegram pe bot ko DM mein `/start` bhejo (bot online hone ka
-confirmation), phir `/btc`, `/eth`, `/sol` jaisa koi manual command
-try karo. Auto-signals apne aap channel mein aane lagenge (pehla
-signal aane mein thoda time lag sakta hai — depends on market
-conditions/score threshold).
+Without Postgres the bot falls back to JSON on the container disk. That
+filesystem is **ephemeral**: every redeploy wipes open trades and history,
+and risk guards restart from zero.
 
-Agar channel mein kuch nahi aa raha:
-- Check karo `CHANNEL_ID` sahi hai (public channel ke liye `@username`
-  format, `t.me/` prefix nahi)
-- Check karo bot channel ka admin hai "Post Messages" permission ke
-  saath
-- Railway logs mein `[CHANNEL SEND ERROR]` ya `CHANNEL_ID not set`
-  jaisi warning dhundo
+Confirm in logs: `[PERSISTENCE] Postgres backend ready` and
+`[INIT] Persistence backend: postgres`.
+
+## 4. Make the bot a channel admin
+Telegram → channel → Administrators → add the bot → enable **Post Messages**.
+
+## 5. Optional volume
+A volume is **optional** if Postgres is configured. Use a volume only if you
+want file logs (`LOG_DIR=/data/logs`) or local JSON backups.
+
+## 6. Deploy & verify
+1. Deploy and watch logs for background tasks started.
+2. DM the bot `/start` from an `ADMIN_IDS` account.
+3. Confirm auto-signals appear in the channel after the warm-up delay.
+4. Restart the service, then `/history` — trades should still be there (Postgres).

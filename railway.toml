@@ -1,4 +1,4 @@
-# Railway deployment config
+# railway.toml — H-014
 [build]
 builder = "NIXPACKS"
 

@@ -7,49 +7,61 @@ command handlers below are for on-demand checks in a direct chat.
 
 import asyncio
 import logging
-import traceback
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 from analytics import performance_text
 from auto_signal import auto_signal_job
-from config import ASSETS, BOT_TOKEN, CHANNEL_ID, effective_decimals
+from config import ADMIN_IDS, ASSETS, BOT_TOKEN, CHANNEL_ID, effective_decimals, require_env
 from daily_summary import daily_summary_job
 from data import get_candles, get_latest_price
 from formatter import format_signal
 from guards import status_text as guards_status_text
 from logger_setup import setup_logging
-from persistence import backend_name
+from persistence import backend_name, is_degraded, postgres_required
 from risk import calculate_trade
 from strategy import get_signal
 from trade_monitor import trade_monitor_job
-from trade_tracker import get_stats, history_text
+from trade_tracker import get_open_trades, get_stats, history_text
 from watchdog import watchdog_job
 
 setup_logging()
 logger = logging.getLogger(__name__)
 
 
+def _authorized(update: Update) -> bool:
+    uid = update.effective_user.id if update.effective_user else None
+    if not ADMIN_IDS:
+        logger.error("ADMIN_IDS not configured — refusing commands")
+        return False
+    return uid in ADMIN_IDS
+
+
+async def _deny(update: Update) -> None:
+    if update.message:
+        await update.message.reply_text("Unauthorized.")
+
+
 # ── lifecycle ─────────────────────────────────────────────────────────────
 
 async def post_init(application: Application) -> None:
-    if not CHANNEL_ID:
-        logger.warning(
-            "[INIT] CHANNEL_ID not set — signals won't be posted anywhere "
-            "until it's configured."
-        )
-
     logger.info(f"[INIT] Persistence backend: {backend_name()}")
-    if backend_name() != "postgres":
+    if postgres_required() and (is_degraded() or backend_name() != "postgres"):
+        raise RuntimeError(
+            "Postgres is required but not ready. Set a working DATABASE_URL "
+            "(Railway Postgres plugin) or ALLOW_JSON_PERSISTENCE=1 for local-only."
+        )
+    if is_degraded() or backend_name() != "postgres":
         logger.warning(
-            "[INIT] Running on JSON files. On Railway without a volume this "
-            "means every redeploy WIPES open trades and history. Add a "
-            "Postgres plugin so DATABASE_URL gets set."
+            "[INIT] Persistence is not durable Postgres. On Railway without "
+            "DATABASE_URL / working JSONB saves, every redeploy WIPES open "
+            "trades and history. Add a Postgres plugin."
         )
 
-    # asyncio keeps only a weak reference to tasks — without a strong
-    # reference the garbage collector can silently kill these mid-run.
+    open_n = len(get_open_trades())
+    logger.info(f"[INIT] Recovered {open_n} open trade(s) from {backend_name()}")
+
     application.bot_data["_bg_tasks"] = [
         asyncio.create_task(auto_signal_job(application),   name="auto_signal"),
         asyncio.create_task(trade_monitor_job(application), name="trade_monitor"),
@@ -60,8 +72,11 @@ async def post_init(application: Application) -> None:
 
 
 async def post_shutdown(application: Application) -> None:
-    for task in application.bot_data.get("_bg_tasks", []):
+    tasks = application.bot_data.get("_bg_tasks", [])
+    for task in tasks:
         task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
     logger.info("[SHUTDOWN] Goodbye.")
 
 
@@ -96,6 +111,9 @@ def _asset_arg(context) -> str | None:
 # ── command handlers ──────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
     asset_lines = "\n".join(
         f"/{a}    — Manual {cfg['label']} signal" for a, cfg in ASSETS.items()
     )
@@ -120,15 +138,20 @@ def _make_asset_handler(asset: str):
     label = cfg["label"]
 
     async def _handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not _authorized(update):
+            await _deny(update)
+            return
         try:
             candles = await asyncio.to_thread(get_candles, asset)
             result, decimals = await _build_result(candles, asset)
-            await update.message.reply_text(
-                format_signal(candles, result, decimals=decimals, label=label)
+            text = format_signal(candles, result, decimals=decimals, label=label)
+            text += (
+                "\n\n⚠️ MANUAL / UNTRACKED — not saved; "
+                "guards & news filter not applied"
             )
+            await update.message.reply_text(text)
         except Exception as e:
-            traceback.print_exc()
-            logger.error(f"[CMD /{asset}] {e}")
+            logger.exception(f"[CMD /{asset}] {e}")
             await update.message.reply_text(f"❌ ERROR\n\n{type(e).__name__}: {e}")
 
     return _handler
@@ -143,6 +166,9 @@ async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def trend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
     try:
         candles = await asyncio.to_thread(get_candles, "btc")
         result, _ = await _build_result(candles, "btc")
@@ -158,12 +184,14 @@ async def trend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"📍 Market        : {result['market_status']}"
         )
     except Exception as e:
-        traceback.print_exc()
-        logger.error(f"[CMD /trend] {e}")
+        logger.exception(f"[CMD /trend] {e}")
         await update.message.reply_text(f"❌ ERROR\n\n{type(e).__name__}: {e}")
 
 
 async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
     try:
         arg = _asset_arg(context)
         if arg and arg not in ASSETS:
@@ -213,11 +241,14 @@ async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"Tip: /stats <asset> for detail (e.g. /stats sol), /perf for expectancy"
         )
     except Exception as e:
-        logger.error(f"[CMD /stats] {e}")
+        logger.exception(f"[CMD /stats] {e}")
         await update.message.reply_text(f"❌ ERROR\n\n{type(e).__name__}: {e}")
 
 
 async def perf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
     try:
         arg = _asset_arg(context)
         if arg and arg not in ASSETS:
@@ -227,19 +258,25 @@ async def perf(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         await update.message.reply_text(performance_text(asset=arg))
     except Exception as e:
-        logger.error(f"[CMD /perf] {e}")
+        logger.exception(f"[CMD /perf] {e}")
         await update.message.reply_text(f"❌ ERROR\n\n{type(e).__name__}: {e}")
 
 
 async def guards(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
     try:
         await update.message.reply_text(guards_status_text())
     except Exception as e:
-        logger.error(f"[CMD /guards] {e}")
+        logger.exception(f"[CMD /guards] {e}")
         await update.message.reply_text(f"❌ ERROR\n\n{type(e).__name__}: {e}")
 
 
 async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not _authorized(update):
+        await _deny(update)
+        return
     try:
         arg = _asset_arg(context)
         if arg and arg not in ASSETS:
@@ -249,16 +286,14 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         await update.message.reply_text(history_text(asset=arg))
     except Exception as e:
-        logger.error(f"[CMD /history] {e}")
+        logger.exception(f"[CMD /history] {e}")
         await update.message.reply_text(f"❌ ERROR\n\n{type(e).__name__}: {e}")
 
 
 # ── entry point ───────────────────────────────────────────────────────────
 
 def main() -> None:
-    if not BOT_TOKEN:
-        logger.critical("BOT_TOKEN environment variable is not set. Exiting.")
-        return
+    require_env()
 
     app = (
         Application.builder()
@@ -279,6 +314,7 @@ def main() -> None:
     app.add_handler(CommandHandler("history", history))
 
     logger.info("🚀 Mahendra Crypto AI Signal starting…")
+    logger.info(f"[INIT] CHANNEL_ID configured; {len(ADMIN_IDS)} admin id(s)")
     app.run_polling(drop_pending_updates=True)
 
 

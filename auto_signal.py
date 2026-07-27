@@ -15,6 +15,7 @@ import time
 from config import (
     ASSETS,
     ASSET_LIST,
+    LIVE_PRICE_DRIFT_MAX,
     MAX_NEW_TRADES_PER_CYCLE,
     SIGNAL_COOLDOWN_SEC,
     SIGNAL_CYCLE_SEC,
@@ -29,7 +30,7 @@ from notify import notify_channel
 from risk import calculate_trade
 from shared_state import heartbeat, trade_lock
 from strategy import get_signal
-from trade_tracker import save_trade
+from trade_tracker import persist_snapshot, save_trade, snapshot_state
 
 logger = logging.getLogger(__name__)
 
@@ -58,12 +59,8 @@ async def _check_asset(application, asset: str) -> bool:
     cfg   = ASSETS[asset.lower()]
     label = cfg["label"]
 
-    # get_candles() does blocking HTTP with retries across 3 timeframes.
-    # Running it on the event loop freezes every command, the monitor and
-    # the watchdog for as long as it takes.
     candles = await asyncio.to_thread(get_candles, asset)
 
-    # Precision derived from the live price, not a hardcoded per-coin number.
     decimals = effective_decimals(asset, candles.get("price"))
 
     result = get_signal(
@@ -76,11 +73,18 @@ async def _check_asset(application, asset: str) -> bool:
         logger.info(f"[AUTO] {asset.upper()} → No Trade")
         return False
 
-    # The strategy's entry is the close of the last fully closed 5-minute
-    # candle, which can already be minutes stale. Re-price off a near-live
-    # quote so the posted entry matches what the user actually sees.
+    signal_price = float(candles["price"])
     live_price = await asyncio.to_thread(get_latest_price, asset)
     if live_price is not None:
+        # H-008: abort if live quote drifted too far from the scored bar
+        if signal_price > 0:
+            drift = abs(live_price - signal_price) / signal_price
+            if drift > LIVE_PRICE_DRIFT_MAX:
+                logger.info(
+                    f"[AUTO] {asset.upper()} aborted — live drift {drift:.2%} "
+                    f"> {LIVE_PRICE_DRIFT_MAX:.2%}"
+                )
+                return False
         decimals = effective_decimals(asset, live_price)
         result.update(calculate_trade(
             result["signal"], live_price, result.get("atr_value", 0),
@@ -88,9 +92,14 @@ async def _check_asset(application, asset: str) -> bool:
         ))
         candles["price"] = live_price
 
+    # M-019: unusable ATR → empty levels → do not open
+    if result.get("entry") is None or result.get("sl") is None:
+        logger.info(f"[AUTO] {asset.upper()} aborted — missing trade levels (ATR?)")
+        return False
+
     message = format_signal(candles, result, decimals=decimals, label=label)
 
-    # ── critical section ──────────────────────────────────────────────────
+    # ── critical section: reserve intent, do NOT persist yet (C-003) ─────
     async with trade_lock:
         if _in_cooldown(asset):
             return False
@@ -104,12 +113,44 @@ async def _check_asset(application, asset: str) -> bool:
             logger.info(f"[GUARD] {asset.upper()} signal blocked — {reason}")
             return False
 
-        save_trade(result, asset=asset)
-        _last_signal_msg[asset]  = message
+        # Reserve dedup key so parallel work does not double-post; cleared on
+        # notify failure.
+        _last_signal_msg[asset] = message
+
+    ok = await notify_channel(application, message)
+    if not ok:
+        async with trade_lock:
+            _last_signal_msg[asset] = None
+        logger.error(f"[AUTO] {asset.upper()} notify failed — trade NOT saved")
+        return False
+
+    # P-003: pre-notify guard decision is authoritative. After a successful
+    # channel post, always save+track — re-checking can_open here created
+    # orphan channel signals with no monitor.
+    async with trade_lock:
+        trade = save_trade(result, asset=asset, persist=False)
+        if trade is None:
+            logger.error(f"[AUTO] {asset.upper()} save_trade rejected after notify")
+            return False
+        snap_trades, snap_id = snapshot_state()
         _last_signal_time[asset] = time.monotonic()
 
-    await notify_channel(application, message)
-    logger.info(f"[AUTO] {asset.upper()} signal posted to channel")
+    persisted = await asyncio.to_thread(persist_snapshot, snap_trades, snap_id)
+    if not persisted:
+        # P-002: in-memory trade exists but disk/Postgres write failed.
+        logger.critical(
+            f"[AUTO] {asset.upper()} #{trade['id']} posted but NOT persisted — "
+            "restart will lose this open trade until Postgres is healthy"
+        )
+        await notify_channel(
+            application,
+            f"⚠️ PERSISTENCE FAILURE\n\n"
+            f"{asset.upper()} signal was posted but trade state did not save.\n"
+            f"Check DATABASE_URL / Postgres immediately.",
+        )
+        return False
+
+    logger.info(f"[AUTO] {asset.upper()} signal posted to channel and tracked")
     return True
 
 
@@ -119,11 +160,6 @@ async def auto_signal_job(application) -> None:
     logger.info(f"[AUTO] Signal job started — cycle {SIGNAL_CYCLE_SEC}s")
     heartbeat["last_cycle"] = time.time()
 
-    # Warm-up: don't scan the instant we boot. Straight after a redeploy the
-    # data is most likely stale and (on ephemeral storage) the guards have no
-    # history to throttle against, so a boot-time scan is exactly when a burst
-    # of near-identical signals gets posted. Stamp the heartbeat while we wait
-    # so the watchdog doesn't mistake the warm-up for a stuck loop.
     if STARTUP_DELAY_SEC > 0:
         logger.info(f"[AUTO] Warm-up — first scan in {STARTUP_DELAY_SEC}s")
         heartbeat["last_cycle"] = time.time()
@@ -133,9 +169,6 @@ async def auto_signal_job(application) -> None:
         try:
             if await asyncio.to_thread(is_high_impact_news):
                 logger.info("[NEWS FILTER] High-impact USD news — signals paused 5 min")
-                # Stamp the heartbeat: this is an intentional pause, not a
-                # stuck loop, and a news window can outlast the watchdog's
-                # stale threshold.
                 heartbeat["last_cycle"] = time.time()
                 await asyncio.sleep(300)
                 continue

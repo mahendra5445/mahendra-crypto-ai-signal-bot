@@ -1,66 +1,49 @@
 """
 Watchdog Job
 
-Purpose: catch SILENT failures — cases where auto_signal_job's loop is
-technically still alive but hasn't completed a real cycle in a long time
-(e.g. Yahoo Finance has been failing for every asset for hours, or an
-unexpected exception outside the per-asset try/except is looping fast
-without ever reaching the heartbeat stamp).
-
-Without this, the bot could sit quietly broken for hours and the only
-sign would be "no signals" — which looks identical to "market is just
-quiet". This job makes that distinction visible.
-
-How it works:
-  - auto_signal.py stamps shared_state.heartbeat["last_cycle"] = time.time()
-    at the end of every full asset-check cycle (normally every ~15 min,
-    or ~5 min when paused for high-impact news).
-  - This job wakes up every CHECK_INTERVAL and compares "now" against
-    that stamp. If it's older than STALE_THRESHOLD, something is stuck.
-  - Sends ONE alert (not one every check) until the loop recovers, so a
-    genuinely stuck bot doesn't spam Telegram every few minutes.
+Purpose: catch SILENT failures — cases where auto_signal_job or
+trade_monitor_job is technically still alive but hasn't completed a real
+cycle in a long time.
 """
 
 import asyncio
 import logging
 import time
 
+from config import MONITOR_INTERVAL_SEC
 from notify import notify_channel
 from shared_state import heartbeat
 
 logger = logging.getLogger(__name__)
 
-CHECK_INTERVAL = 300          # check every 5 minutes
-STALE_THRESHOLD = 40 * 60     # alert if no cycle completed in 40 min
-                               # (normal cycle is 15 min, or 5 min during
-                               # a news pause — 40 min gives generous
-                               # margin for a couple of retried API calls
-                               # before flagging a real problem)
+CHECK_INTERVAL = 300
+STALE_THRESHOLD = 40 * 60
+MONITOR_STALE = max(3 * MONITOR_INTERVAL_SEC, 180)
 
-_alerted = False   # tracks whether we've already sent the "stuck" alert
-
-
-async def _notify_all(application, text: str) -> None:
-    await notify_channel(application, text)
+_alerted_signal = False
+_alerted_monitor = False
 
 
 async def watchdog_job(application) -> None:
-    global _alerted
+    global _alerted_signal, _alerted_monitor
     logger.info("[WATCHDOG] Started")
 
     while True:
         await asyncio.sleep(CHECK_INTERVAL)
 
+        now = time.time()
         last_cycle = heartbeat.get("last_cycle", 0.0)
-        stale_for = time.time() - last_cycle
+        last_monitor = heartbeat.get("last_monitor", 0.0)
+        stale_signal = now - last_cycle
+        stale_monitor = now - last_monitor if last_monitor else stale_signal
 
-        if stale_for > STALE_THRESHOLD:
-            if not _alerted:
-                minutes = int(stale_for // 60)
+        if stale_signal > STALE_THRESHOLD:
+            if not _alerted_signal:
+                minutes = int(stale_signal // 60)
                 logger.error(
                     f"[WATCHDOG] Auto-signal loop stuck — no cycle in {minutes} min"
                 )
-                await _notify_all(
+                await notify_channel(
                     application,
                     "⚠️ WATCHDOG ALERT\n\n"
                     f"Auto-signal loop hasn't completed a cycle in "
@@ -68,14 +51,38 @@ async def watchdog_job(application) -> None:
                     "Possible causes: Yahoo Finance repeatedly failing, "
                     "network issue, or an unhandled crash in the signal "
                     "loop. Check Railway logs.\n\n"
-                    "This alert won't repeat until the loop recovers."
+                    "This alert won't repeat until the loop recovers.",
                 )
-                _alerted = True
+                _alerted_signal = True
         else:
-            if _alerted:
+            if _alerted_signal:
                 logger.info("[WATCHDOG] Auto-signal loop recovered")
-                await _notify_all(
+                await notify_channel(
                     application,
-                    "✅ WATCHDOG — Auto-signal loop is back to normal."
+                    "✅ WATCHDOG — Auto-signal loop is back to normal.",
                 )
-            _alerted = False
+            _alerted_signal = False
+
+        # L-008: also watch the trade monitor
+        if last_monitor and stale_monitor > MONITOR_STALE:
+            if not _alerted_monitor:
+                minutes = int(stale_monitor // 60)
+                logger.error(
+                    f"[WATCHDOG] Trade-monitor stuck — no poll in {minutes} min"
+                )
+                await notify_channel(
+                    application,
+                    "⚠️ WATCHDOG ALERT\n\n"
+                    f"Trade monitor hasn't completed a poll in {minutes} minutes "
+                    f"(expected every ~{MONITOR_INTERVAL_SEC}s).\n\n"
+                    "Open trades may not be tracked until it recovers.",
+                )
+                _alerted_monitor = True
+        else:
+            if _alerted_monitor and last_monitor:
+                logger.info("[WATCHDOG] Trade-monitor recovered")
+                await notify_channel(
+                    application,
+                    "✅ WATCHDOG — Trade monitor is back to normal.",
+                )
+            _alerted_monitor = False

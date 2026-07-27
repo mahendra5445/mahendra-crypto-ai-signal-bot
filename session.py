@@ -1,6 +1,6 @@
 
 """
-Trading Session Filter (based on UTC time)
+Trading Session Filter (based on fixed UTC hour windows — not DST-aware).
 London  : 08:00 - 16:00 UTC
 New York: 13:00 - 21:00 UTC
 Asian   : 00:00 - 08:00 UTC

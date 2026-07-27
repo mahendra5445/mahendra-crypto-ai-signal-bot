@@ -2,65 +2,47 @@
 Trade Monitor Job — walks each open trade forward through the 1-minute bars
 that happened AFTER it was opened, and fires SL / TP1 / TP2 / TP3 in the
 order the market actually produced them.
-
-Two structural bugs are fixed here, and they were the biggest single cause
-of the destroyed win rate:
-
-  A. PRE-ENTRY BARS.  The old version asked for "the last 3 bars" with no
-     timestamps and evaluated them against a trade that may have opened
-     seconds ago. A brand-new trade was therefore judged on three minutes
-     of price action from BEFORE its own entry, so a large share of trades
-     were closed — as SL, or as a fake TP1 that instantly moved the stop to
-     breakeven — on their very first poll. Now every bar that started
-     before the entry timestamp is discarded.
-
-  B. MERGED WINDOW.  The old version collapsed 3 bars into one high/low
-     pair and checked SL first, so any window where both the stop and the
-     target were touched became a loss regardless of which came first.
-     Now bars are replayed one at a time in chronological order, so a TP1
-     in minute 1 followed by a stop in minute 3 is correctly a breakeven,
-     not a loss. Within a SINGLE bar the order is genuinely unknowable from
-     OHLC, so we stay pessimistic and take the stop — the standard,
-     defensible convention.
 """
 
 import asyncio
 import logging
+import time
 
 from config import MONITOR_INTERVAL_SEC, effective_decimals
 from data import get_recent_bars
 from notify import notify_channel
-from shared_state import trade_lock
+from shared_state import heartbeat, trade_lock
 from trade_tracker import (
     get_open_trades,
     mark_tp1_hit,
     mark_tp2_hit,
+    persist_snapshot,
+    snapshot_state,
     update_trade,
 )
 
 logger = logging.getLogger(__name__)
 
 CHECK_INTERVAL = MONITOR_INTERVAL_SEC
-
-# Small margin beyond the SL required before a close is confirmed, so a
-# single glitched Yahoo print can't stop out a trade on a price that never
-# really traded. 0.03% of price is far smaller than the ATR-based stop.
 SL_BUFFER_PCT = 0.0003
-
-# How many bars back to request. The monitor polls every 60s, so ~20 bars is
-# a generous overlap that survives a few failed cycles without leaving a gap.
 BAR_LOOKBACK = 20
 
 
-# ── event detection for ONE bar ───────────────────────────────────────────
+def bars_usable_after_entry(bars: list[dict], opened_ts: float | None) -> list[dict]:
+    """
+    Filter 1m bars that are relevant after trade entry (P-004).
+
+    Yahoo 1m bar timestamps are candle OPEN times. Flooring opened_ts to the
+    containing minute includes the in-progress entry candle without replaying
+    earlier full minutes (which caused false SL hits historically).
+    """
+    if not opened_ts:
+        return bars[-1:] if bars else []
+    entry_bar_open = int(opened_ts) - (int(opened_ts) % 60)
+    return [b for b in bars if b["ts"] >= entry_bar_open]
+
 
 def _events_for_bar(trade: dict, bar: dict) -> list[str]:
-    """
-    Events triggered by a single 1-minute bar, computed against the trade's
-    CURRENT state so levels already hit are excluded.
-
-    Returns at most one closing event, and it is always last in the list.
-    """
     is_buy = trade["signal"] == "BUY"
     high, low = bar["high"], bar["low"]
 
@@ -86,39 +68,22 @@ def _events_for_bar(trade: dict, bar: dict) -> list[str]:
         tps.append("tp3")
 
     if sl_hit:
-        # Same bar, both sides touched: we cannot know the order from OHLC.
-        # Stay pessimistic and take the stop — but only after crediting any
-        # TP that is BEYOND the stop in the favourable direction is not
-        # possible, so we simply close here.
         return ["be" if trade["hit_tp1"] else "sl"]
 
     return tps
 
 
-# ── per-trade replay ──────────────────────────────────────────────────────
-
 async def _check_trade(application, trade: dict, bars: list[dict]) -> None:
     notifications: list[str] = []
+    need_persist = False
 
     decimals = effective_decimals(trade["asset"], trade.get("entry"))
 
     async with trade_lock:
-        # Re-check inside the lock — another coroutine may have closed it.
         if trade["status"] != "OPEN":
             return
 
-        opened_ts = trade.get("opened_ts")
-
-        # Only bars that STARTED at or after the entry. A bar that was
-        # already in progress when the trade opened contains pre-entry
-        # price action, so it is dropped too.
-        if opened_ts:
-            usable = [b for b in bars if b["ts"] >= opened_ts]
-        else:
-            # Legacy trade saved before opened_ts existed — we cannot prove
-            # any bar is post-entry, so use only the newest bar rather than
-            # replaying unknown history against it.
-            usable = bars[-1:]
+        usable = bars_usable_after_entry(bars, trade.get("opened_ts"))
 
         if not usable:
             return
@@ -134,7 +99,8 @@ async def _check_trade(application, trade: dict, bars: list[dict]) -> None:
             for level in events:
                 if level in ("sl", "be"):
                     status = "SL" if level == "sl" else "BE"
-                    if update_trade(trade["id"], status, exit_price=bar["close"]):
+                    if update_trade(trade["id"], status, exit_price=bar["close"], persist=False):
+                        need_persist = True
                         if level == "sl":
                             notifications.append(
                                 f"🛑 SL HIT\n\n"
@@ -156,30 +122,33 @@ async def _check_trade(application, trade: dict, bars: list[dict]) -> None:
                     break
 
                 if level == "tp1":
-                    mark_tp1_hit(trade)   # keeps original_sl, moves sl to entry
-                    notifications.append(
-                        f"🎯 TP1 HIT\n\n"
-                        f"#{trade['id']} | {trade['asset'].upper()} | {trade['signal']}\n"
-                        f"Entry : {trade['entry']}\n"
-                        f"TP1   : {trade['tp1']}\n"
-                        f"Price : {price_display}\n\n"
-                        f"✅ SL moved to Breakeven"
-                    )
+                    if mark_tp1_hit(trade, persist=False):
+                        need_persist = True
+                        notifications.append(
+                            f"🎯 TP1 HIT\n\n"
+                            f"#{trade['id']} | {trade['asset'].upper()} | {trade['signal']}\n"
+                            f"Entry : {trade['entry']}\n"
+                            f"TP1   : {trade['tp1']}\n"
+                            f"Price : {price_display}\n\n"
+                            f"✅ SL moved to Breakeven"
+                        )
 
                 elif level == "tp2":
-                    mark_tp2_hit(trade)
-                    notifications.append(
-                        f"🎯🎯 TP2 HIT\n\n"
-                        f"#{trade['id']} | {trade['asset'].upper()} | {trade['signal']}\n"
-                        f"Entry : {trade['entry']}\n"
-                        f"TP2   : {trade['tp2']}\n"
-                        f"Price : {price_display}\n\n"
-                        f"✅ Trail SL for remaining position"
-                    )
+                    if mark_tp2_hit(trade, persist=False):
+                        need_persist = True
+                        notifications.append(
+                            f"🎯🎯 TP2 HIT\n\n"
+                            f"#{trade['id']} | {trade['asset'].upper()} | {trade['signal']}\n"
+                            f"Entry : {trade['entry']}\n"
+                            f"TP2   : {trade['tp2']}\n"
+                            f"Price : {price_display}\n\n"
+                            f"✅ Trail SL for remaining position"
+                        )
 
                 elif level == "tp3":
                     trade["hit_tp3"] = True
-                    if update_trade(trade["id"], "TP", exit_price=trade["tp3"]):
+                    if update_trade(trade["id"], "TP", exit_price=trade["tp3"], persist=False):
+                        need_persist = True
                         notifications.append(
                             f"🎯🎯🎯 TP3 HIT — FULL TARGET\n\n"
                             f"#{trade['id']} | {trade['asset'].upper()} | {trade['signal']}\n"
@@ -194,15 +163,28 @@ async def _check_trade(application, trade: dict, bars: list[dict]) -> None:
             if closed:
                 break
 
-    # Telegram I/O happens outside the lock
+        snap = snapshot_state() if need_persist else None
+
+    if need_persist and snap is not None:
+        ok = await asyncio.to_thread(persist_snapshot, snap[0], snap[1])
+        if not ok:
+            logger.critical(
+                f"[MONITOR] Persist failed after updating #{trade.get('id')} — "
+                "open/closed state may be lost on restart"
+            )
+            notifications.append(
+                "⚠️ PERSISTENCE FAILURE\n\n"
+                "Trade monitor updated in-memory state but could not save.\n"
+                "Check DATABASE_URL / Postgres immediately."
+            )
+
     for msg in notifications:
         await notify_channel(application, msg)
 
 
-# ── main job loop ─────────────────────────────────────────────────────────
-
 async def trade_monitor_job(application) -> None:
     logger.info(f"[MONITOR] Started — polling every {CHECK_INTERVAL}s")
+    heartbeat["last_monitor"] = time.time()
     while True:
         try:
             open_trades = get_open_trades()
@@ -235,4 +217,5 @@ async def trade_monitor_job(application) -> None:
         except Exception as e:
             logger.error(f"[MONITOR ERROR] {e}")
 
+        heartbeat["last_monitor"] = time.time()
         await asyncio.sleep(CHECK_INTERVAL)

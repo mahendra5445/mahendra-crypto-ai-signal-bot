@@ -66,7 +66,16 @@ def pause_remaining_sec() -> int:
 
 def trades_today() -> int:
     today = today_str()
-    return sum(1 for t in all_trades() if str(t.get("time", "")).startswith(today))
+    n = 0
+    for t in all_trades():
+        # M-010: prefer opened_day; fall back to time prefix for legacy rows
+        day = t.get("opened_day")
+        if day:
+            if day == today:
+                n += 1
+        elif str(t.get("time", "")).startswith(today):
+            n += 1
+    return n
 
 
 def open_count() -> int:

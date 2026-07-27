@@ -2,6 +2,10 @@ from indicators import ema
 
 
 def get_trend(close_prices):
+    # M-021: short / empty series → Sideways (unstable EMA200 otherwise)
+    if not close_prices or len(close_prices) < 200:
+        return "Sideways"
+
     price = round(close_prices[-1], 6)
 
     ema20 = ema(close_prices, 20)

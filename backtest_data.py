@@ -17,7 +17,7 @@ import csv
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -157,8 +157,8 @@ def _fetch_coinbase(product: str, start_ms: int, end_ms: int) -> list[dict]:
                 f"{COINBASE}/products/{product}/candles",
                 params={
                     "granularity": 60,
-                    "start": datetime.utcfromtimestamp(cursor).isoformat(),
-                    "end":   datetime.utcfromtimestamp(stop).isoformat(),
+                    "start": datetime.fromtimestamp(cursor, tz=timezone.utc).isoformat(),
+                    "end":   datetime.fromtimestamp(stop, tz=timezone.utc).isoformat(),
                 },
                 timeout=20,
             )

@@ -13,8 +13,6 @@ import asyncio
 # NOT during network I/O (API fetches / Telegram sends).
 trade_lock: asyncio.Lock = asyncio.Lock()
 
-# Heartbeat: auto_signal_job stamps this after every full asset-check
-# cycle. watchdog.py reads it to detect a stuck/silently-dead loop
-# (e.g. every asset's API call has been failing for hours) without the
-# two modules importing each other directly.
-heartbeat: dict = {"last_cycle": 0.0}
+# Heartbeat: auto_signal_job stamps last_cycle; trade_monitor_job stamps
+# last_monitor. watchdog.py reads both to detect stuck loops.
+heartbeat: dict = {"last_cycle": 0.0, "last_monitor": 0.0}

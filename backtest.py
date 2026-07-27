@@ -13,25 +13,22 @@ Usage:
     python backtest.py --days 90 --fee-bps 0        # frictionless, for comparison
 
 WHAT IT SIMULATES FAITHFULLY
-  - the 15-minute scan cycle, per-asset cooldown, and every risk guard
+  - the 15-minute scan cycle and per-asset cooldown
+  - one open trade per asset at a time
   - entry at the close of the 5-minute bar the signal fired on
   - SL/TP resolution on 1-minute bars, replayed in order, with the same
     pessimistic same-bar convention the live monitor uses
   - the session filter, driven by each BAR's timestamp rather than the
     wall clock
 
-WHAT IT CANNOT SIMULATE — read this before trusting a number
-  - The news filter is skipped (it needs a live feed), so the backtest
-    takes trades the live bot would have sat out.
-  - Live entries come from a Yahoo quote; these come from Binance closes.
-    Real fills will differ, and never in your favour.
-  - No order book. A market that gaps through your stop fills worse than
-    the stop price; this assumes you get the stop.
-  - Binance history only contains pairs that still exist today.
-  - Most importantly: this is ONE historical path. A good result is not
-    proof of an edge, and re-tuning parameters until the number improves
-    is how you fit noise. If you change settings, re-check on a period you
-    did not tune on.
+WHAT IT DOES NOT SIMULATE
+  - book-level risk guards (MAX_OPEN_TRADES, MAX_TRADES_PER_DAY,
+    consecutive-loss pause) — those are live-only in guards.py
+  - the news filter (needs a live feed)
+  - live Yahoo quote re-pricing / drift abort
+  - order-book slippage; gaps through stops fill at the stop in this model
+  - One historical path is evidence, not proof — do not retune on the
+    same sample you evaluate.
 """
 
 from __future__ import annotations

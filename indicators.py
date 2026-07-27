@@ -86,7 +86,8 @@ def vwap(high, low, close, volume):
 def bollinger_bands(values, period=20, std_dev=2):
     s = pd.Series(values)
     mid = s.rolling(period).mean()
-    std = s.rolling(period).std()
+    # ddof=0 matches TradingView population std (info-only BB path)
+    std = s.rolling(period).std(ddof=0)
     return {
         "upper": round((mid + std * std_dev).iloc[-1], 6),
         "middle": round(mid.iloc[-1], 6),
@@ -129,62 +130,57 @@ def atr_moving_average(high, low, close, atr_period=14, ma_period=20):
 
 def supertrend(high, low, close, period=10, multiplier=3):
     """
-    Proper stateful Supertrend calculation.
-
-    The old version compared only the latest candle to a single
-    upper/lower band and defaulted to "Bullish" any time price sat
-    between the bands (which is most of the time) - that silently
-    biased every signal toward BUY regardless of real trend.
-
-    This version walks the whole series, flips trend only when price
-    actually closes beyond the trailing band (the real Supertrend
-    rule), and has no directional default.
+    Proper stateful Supertrend calculation (NumPy loop for H-016 performance;
+    algorithm unchanged from the prior pandas iloc version).
     """
-    high_s = pd.Series(high)
-    low_s = pd.Series(low)
-    close_s = pd.Series(close)
+    import numpy as np
 
-    tr = pd.concat([
-        high_s - low_s,
-        (high_s - close_s.shift()).abs(),
-        (low_s - close_s.shift()).abs(),
-    ], axis=1).max(axis=1)
-    atr_series = tr.rolling(period).mean()
+    high_a = np.asarray(high, dtype="float64")
+    low_a = np.asarray(low, dtype="float64")
+    close_a = np.asarray(close, dtype="float64")
+    n = len(close_a)
 
-    hl2 = (high_s + low_s) / 2
+    tr = np.maximum(high_a - low_a, np.maximum(
+        np.abs(high_a - np.roll(close_a, 1)),
+        np.abs(low_a - np.roll(close_a, 1)),
+    ))
+    tr[0] = high_a[0] - low_a[0]
+
+    atr_series = pd.Series(tr).rolling(period).mean().to_numpy()
+
+    hl2 = (high_a + low_a) / 2.0
     basic_upper = hl2 + multiplier * atr_series
     basic_lower = hl2 - multiplier * atr_series
 
-    start = atr_series.first_valid_index()
-    if start is None or start >= len(close_s) - 1:
-        # BUG FIX: pehle yahan "Bearish" return hota tha jab data kam hota
-        # tha - comment khud keh raha tha "neutral, not Bullish" lekin code
-        # Bearish bhej raha tha, jo SELL ki taraf bias deta tha.
-        # "Neutral" return karne se strategy mein st_bull aur st_bear dono
-        # False rahenge - na BUY ki taraf jhukao, na SELL ki taraf.
-        return {"trend": "Neutral", "value": round(close[-1], 6)}
+    start = None
+    for i in range(n):
+        if not np.isnan(atr_series[i]):
+            start = i
+            break
+    if start is None or start >= n - 1:
+        return {"trend": "Neutral", "value": round(float(close_a[-1]), 6)}
 
     final_upper = basic_upper.copy()
     final_lower = basic_lower.copy()
-    trend = ["Bullish"] * len(close_s)
-    trend[start] = "Bullish" if close_s.iloc[start] >= hl2.iloc[start] else "Bearish"
+    trend = [None] * n
+    trend[start] = "Bullish" if close_a[start] >= hl2[start] else "Bearish"
 
-    for i in range(start + 1, len(close_s)):
-        if basic_upper.iloc[i] < final_upper.iloc[i - 1] or close_s.iloc[i - 1] > final_upper.iloc[i - 1]:
-            final_upper.iloc[i] = basic_upper.iloc[i]
+    for i in range(start + 1, n):
+        if basic_upper[i] < final_upper[i - 1] or close_a[i - 1] > final_upper[i - 1]:
+            final_upper[i] = basic_upper[i]
         else:
-            final_upper.iloc[i] = final_upper.iloc[i - 1]
+            final_upper[i] = final_upper[i - 1]
 
-        if basic_lower.iloc[i] > final_lower.iloc[i - 1] or close_s.iloc[i - 1] < final_lower.iloc[i - 1]:
-            final_lower.iloc[i] = basic_lower.iloc[i]
+        if basic_lower[i] > final_lower[i - 1] or close_a[i - 1] < final_lower[i - 1]:
+            final_lower[i] = basic_lower[i]
         else:
-            final_lower.iloc[i] = final_lower.iloc[i - 1]
+            final_lower[i] = final_lower[i - 1]
 
         if trend[i - 1] == "Bullish":
-            trend[i] = "Bearish" if close_s.iloc[i] < final_lower.iloc[i] else "Bullish"
+            trend[i] = "Bearish" if close_a[i] < final_lower[i] else "Bullish"
         else:
-            trend[i] = "Bullish" if close_s.iloc[i] > final_upper.iloc[i] else "Bearish"
+            trend[i] = "Bullish" if close_a[i] > final_upper[i] else "Bearish"
 
     last_trend = trend[-1]
-    last_value = final_lower.iloc[-1] if last_trend == "Bullish" else final_upper.iloc[-1]
-    return {"trend": last_trend, "value": round(last_value, 6)}
+    last_value = final_lower[-1] if last_trend == "Bullish" else final_upper[-1]
+    return {"trend": last_trend, "value": round(float(last_value), 6)}
