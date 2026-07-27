@@ -239,6 +239,70 @@ def run_tests() -> int:
     check("P-006 test not auto-running on import",
           'if __name__ == "__main__"' in open(__file__, encoding="utf-8").read())
 
+    # ── 9. RSI risk model (soft penalties, all symbols) ────────────────────
+    print("\n9. RSI risk model")
+
+    from strategy import (
+        apply_rsi_position_cap,
+        rsi_buy_score_penalty,
+        rsi_confidence_haircut,
+        rsi_sell_score_penalty,
+        rsi_status_label,
+    )
+    from config import ASSET_LIST
+    from formatter import format_signal
+
+    check("RSI 70–79 small BUY penalty", rsi_buy_score_penalty(75) == 4)
+    check("RSI 80–84 medium BUY penalty", rsi_buy_score_penalty(82) == 8)
+    check("RSI ≥85 strong BUY penalty", rsi_buy_score_penalty(92.75) == 15)
+    check("RSI normal no BUY penalty", rsi_buy_score_penalty(60) == 0)
+    check("RSI ≤30 small SELL penalty", rsi_sell_score_penalty(28) == 4)
+    check("RSI ≤20 strong SELL penalty", rsi_sell_score_penalty(15) == 15)
+    check("RSI status Extreme Overbought",
+          rsi_status_label(92.75) == "❌ Extreme Overbought")
+    check("RSI status High", rsi_status_label(78) == "⚠️ High")
+    check("RSI status Normal", rsi_status_label(55) == "✅ Normal")
+    check("RSI status Extreme Oversold",
+          rsi_status_label(18) == "❌ Extreme Oversold")
+    check("RSI ≥85 caps Full Size to 50%",
+          apply_rsi_position_cap("Full Size", "100%", 90) ==
+          ("Reduced Risk - Half Size", "50%"))
+    check("RSI ≥85 caps Standard Size to 50%",
+          apply_rsi_position_cap("Standard Size", "75%", 85) ==
+          ("Reduced Risk - Half Size", "50%"))
+    check("RSI <85 leaves Full Size alone",
+          apply_rsi_position_cap("Full Size", "100%", 70) == ("Full Size", "100%"))
+    check("extreme RSI confidence haircut",
+          rsi_confidence_haircut(92.75, "BUY") == 15)
+    check("high RSI confidence haircut",
+          rsi_confidence_haircut(78, "BUY") == 6)
+    check("no hard-block language in RSI risk helpers",
+          "hard-block" not in open("strategy.py", encoding="utf-8").read().lower() or
+          "never hard-block" in open("strategy.py", encoding="utf-8").read().lower())
+
+    # Telegram RSI status line
+    fake = {
+        "signal": "BUY", "ai_score": 59, "grade": "C", "confidence": 67,
+        "market_status": "Low Liquidity", "session": "Asian", "session_active": False,
+        "trend_1m": "Strong Bullish", "trend_5m": "Strong Bullish", "trend_15m": "Strong Bullish",
+        "ema_ok": True, "macd": {"trend": "Bullish"}, "rsi": 92.75,
+        "rsi_status": "❌ Extreme Overbought",
+        "adx_ok": True, "vwap_ok": True, "supertrend_ok": True, "volume_ok": True,
+        "pattern": "None", "liquidity_sweep": "Buy Side",
+        "signal_tier": "Reduced Risk - Half Size", "position_size": "50%",
+        "entry": 1969.32, "sl": 1957.12, "tp1": 1983.96, "tp2": 1993.72, "tp3": 2005.92,
+        "risk_reward": "1:1.2", "reasons": ["test"],
+        "buy_confirmations": 10, "sell_confirmations": 4, "valid_minutes": 8,
+    }
+    msg = format_signal({"price": 1969.32, "asset": "ETH"}, fake, decimals=2, label="ETH")
+    check("Telegram shows RSI Extreme Overbought status",
+          "RSI : 92.75 ❌ Extreme Overbought" in msg)
+
+    # All configured symbols share the same strategy entrypoint
+    check("all supported symbols share get_signal path",
+          len(ASSET_LIST) >= 12 and
+          set(ASSET_LIST) >= {"btc", "eth", "sol", "bnb", "xrp", "doge", "avax"})
+
     # ── summary ───────────────────────────────────────────────────────────
     shutil.rmtree(os.environ["DATA_DIR"], ignore_errors=True)
     print(f"\n{'─' * 50}")

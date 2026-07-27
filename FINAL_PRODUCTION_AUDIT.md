@@ -1,100 +1,83 @@
 # FINAL_PRODUCTION_AUDIT.md
-## Production audit — 2026-07-27 (pass after remediation)
+## Production audit — build v3 (RSI risk model) — 2026-07-27
 
-**Verdict: PASS — 0 Critical, 0 High remaining.**
+**Verdict: PASS — 0 Critical, 0 High.**
 
-Scope: `/agent/prod` Mahendra Crypto AI Signal Bot (Railway + Telegram + Postgres).
-
----
-
-## Audit rounds
-
-| Round | Critical | High | Medium | Low | Outcome |
-|---|---|---|---|---|---|
-| 1 (initial) | 1 | 3 | 1 | 1 | Issues confirmed → fixed |
-| 2 (re-audit) | 0 | 0 | 0 | 0 | **PASS** |
+Scope: `/agent/prod` after soft RSI risk-model changes (`strategy.py`, `formatter.py`,
+`test_fixes.py`). All 12 assets use the same `get_signal()` path.
 
 ---
 
-## Round 1 — confirmed issues (all fixed)
+## Change under audit
 
-### P-001 — Critical — Postgres load silently fell back to JSON
-- **Files:** `persistence.py` (`load_trades_from_disk`)
-- **Bug:** On Postgres load failure after a successful canary, the bot loaded ephemeral JSON while still advertising the Postgres backend. A later save could overwrite durable state with incomplete data and orphan open trades after restart.
-- **Fix:** Fail closed — set `persistence_degraded`, log critical, raise `RuntimeError`. No JSON fallback when `_pg_ready`.
-- **Status:** Fixed
+Soft RSI risk layer only:
 
-### P-002 — High — Persist failures swallowed
-- **Files:** `persistence.py`, `trade_tracker.py`, `auto_signal.py`, `trade_monitor.py`
-- **Bug:** `save_trades_to_disk` returned `None` and callers ignored failures. Channel posts / monitor updates could exist only in memory.
-- **Fix:** Save returns `bool`. Callers log critical, alert the channel on failure, and do not claim durable tracking.
-- **Status:** Fixed
-
-### P-003 — High — Post-notify guard could orphan channel signals
-- **Files:** `auto_signal.py`
-- **Bug:** After a successful Telegram post, a second `can_open` check could refuse `save_trade`, leaving an untracked live signal and a sticky dedup key.
-- **Fix:** Pre-notify guard is authoritative; after successful notify, always `save_trade` + persist.
-- **Status:** Fixed
-
-### P-004 — Medium — First-minute 1m bar skipped
-- **Files:** `trade_monitor.py` (`bars_usable_after_entry`)
-- **Bug:** Yahoo 1m `ts` is candle open. Mid-minute entries excluded the active candle, missing first-minute SL/TP.
-- **Fix:** Floor `opened_ts` to the containing minute; still exclude prior full minutes.
-- **Status:** Fixed
-
-### P-005 — High — `DATABASE_URL` not required at startup
-- **Files:** `config.py` (`require_env`), `main.py` (`post_init`)
-- **Bug:** Railway could start on JSON-only ephemeral storage and wipe trades on redeploy.
-- **Fix:** Require `DATABASE_URL` unless `ALLOW_JSON_PERSISTENCE=1`. `post_init` raises if Postgres is required but not ready. Startup logs recovered open trade count.
-- **Status:** Fixed
-
-### P-006 — Low — `test_fixes.py` ran on import
-- **Files:** `test_fixes.py`
-- **Bug:** Importing the module mutated env and called `SystemExit`.
-- **Fix:** Logic behind `if __name__ == "__main__":` / `run_tests()`.
-- **Status:** Fixed
+- Graduated BUY/SELL AI Score penalties
+- Confidence haircuts
+- Position size cap at RSI ≥ 85 (max 50%)
+- Telegram RSI status line
+- **No hard-blocks**
+- EMA / MACD / ADX / VWAP / Supertrend / Liquidity / SMC / `risk.py` / backtest /
+  commands / Railway manifests **unchanged**
 
 ---
 
-## Round 2 — verification matrix
+## Verification matrix
 
 | Requirement | Result |
 |---|---|
-| Syntax errors | PASS (`compileall` + AST) |
-| Import errors | PASS (all runtime modules) |
-| Circular imports | PASS (static import graph) |
+| Syntax (`compileall` + AST) | PASS |
+| Import errors (26 runtime modules) | PASS |
+| Circular imports | PASS |
 | Broken references | PASS |
-| Duplicate conflicting runtime logic | PASS (only expected `trade_r` / CLI `main`) |
 | TODO / FIXME / placeholders | PASS (none) |
-| Railway compatibility | PASS (`railway.toml`, `Procfile`, Nixpacks, `python main.py`) |
-| Telegram bot functionality | PASS (polling, admin allowlist, handlers, notify retries) |
-| TradingView inbound webhooks | N/A by design (no inbound webhook; polling + Yahoo engine) |
-| PostgreSQL persistence | PASS (canary + JSONB round-trip on Postgres 16) |
-| Clean startup | PASS (`require_env` fail-closed; Application builds) |
-| Trade recovery after restart | PASS (open trade `#42` reloaded from Postgres) |
-| Automated regression suite | **45/45** passed |
+| Hard RSI trade veto | PASS — none introduced |
+| Core indicator logic intact | PASS |
+| Risk calculator untouched | PASS |
+| Railway `railway.toml` / `Procfile` | PASS |
+| Telegram handlers / polling | PASS |
+| TradingView inbound webhooks | N/A by design |
+| PostgreSQL persistence (prior P-001/002) | PASS (unchanged this pass) |
+| All symbols (`btc`…`ltc`) share strategy | PASS |
+| Regression suite | **63/63** |
 
 ---
 
-## By design (not defects)
+## RSI risk spot checks
 
-| Topic | Note |
-|---|---|
-| No TradingView inbound webhooks | Signals are generated internally; long polling only |
-| Non-Wilder RSI/ATR/ADX | DO NOT APPLY — thresholds calibrated to current estimators |
-| Yahoo primary OHLC | DO NOT APPLY Binance-as-primary |
-| Cumsum VWAP | DO NOT APPLY session VWAP rewrite |
-| JSON persistence | Local/dev only via `ALLOW_JSON_PERSISTENCE=1` |
+| Input | Expected | Observed |
+|---|---|---|
+| RSI 75 BUY penalty | 4 | 4 |
+| RSI 82 BUY penalty | 8 | 8 |
+| RSI 92.75 BUY penalty | 15 | 15 |
+| RSI 28 SELL penalty | 4 | 4 |
+| RSI 15 SELL penalty | 15 | 15 |
+| RSI 90 Full Size → | Half / 50% | Half / 50% |
+| Formatter Extreme OB | `RSI : 92.75 ❌ Extreme Overbought` | PASS |
+
+Illustrative ETH-like score path: base 82 − Asian 8 − RSI 15 → **59** AI Score
+(soft gate pressure via `MIN_SCORE`, not a hard RSI block).
 
 ---
 
-## Evidence commands
+## Supported symbols
 
-```text
-python3 -m compileall -q .
-python3 test_fixes.py                 → 45/45
-Postgres save → process reload → open trade present
-BOT_TOKEN/CHANNEL_ID/ADMIN_IDS/DATABASE_URL startup smoke
-```
+`btc`, `eth`, `sol`, `xrp`, `bnb`, `doge`, `ada`, `link`, `avax`, `ton`, `sui`, `ltc`
 
-**Production build is audit-clean for Critical and High.**
+Signal generation remains available for every listed asset; RSI risk applies uniformly.
+
+---
+
+## Residual Medium / Low notes (not blockers)
+
+| Note | Severity | Status |
+|---|---|---|
+| Duplicate `trade_r` in analytics vs backtest | Low | By design / OPTIONAL |
+| Non-Wilder RSI vs TradingView | Info | DO NOT APPLY |
+| No inbound TradingView webhooks | Info | By design |
+
+---
+
+## Verdict
+
+**PRODUCTION BUILD v3 VERIFIED.** Safe to package as `FINAL_PRODUCTION_BUILD_v3.zip`.

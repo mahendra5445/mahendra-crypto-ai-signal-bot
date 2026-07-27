@@ -47,6 +47,75 @@ W_LIQUIDITY = 9
 # or 11 (with volume); liquidity is informational only (H-005 / H-006).
 SIGNAL_VALID_MINUTES = 8
 
+# ==========================
+# RSI RISK MODEL (soft penalties — never hard-blocks)
+# Applies to every asset via get_signal(); does not alter indicator formulas.
+# ==========================
+RSI_BUY_PENALTY_HIGH = 4       # RSI 70–79
+RSI_BUY_PENALTY_MEDIUM = 8     # RSI 80–84
+RSI_BUY_PENALTY_STRONG = 15    # RSI ≥ 85
+RSI_SELL_PENALTY_SMALL = 4     # RSI ≤ 30
+RSI_SELL_PENALTY_STRONG = 15   # RSI ≤ 20
+
+RSI_CONF_HAIRCUT_HIGH = 6      # RSI High (70–84)
+RSI_CONF_HAIRCUT_EXTREME = 15  # Extreme OB (≥85) or Extreme OS (≤20)
+RSI_CONF_HAIRCUT_SELL_SOFT = 4 # RSI 21–30 on SELL
+
+
+def rsi_status_label(rsi_value: float) -> str:
+    """Telegram RSI status — same for all symbols."""
+    if rsi_value >= 85:
+        return "❌ Extreme Overbought"
+    if rsi_value >= 70:
+        return "⚠️ High"
+    if rsi_value <= 20:
+        return "❌ Extreme Oversold"
+    return "✅ Normal"
+
+
+def rsi_buy_score_penalty(rsi_value: float) -> int:
+    """Extra BUY AI-score penalty for extended overbought (beyond W_RSI miss)."""
+    if rsi_value >= 85:
+        return RSI_BUY_PENALTY_STRONG
+    if rsi_value >= 80:
+        return RSI_BUY_PENALTY_MEDIUM
+    if rsi_value >= 70:
+        return RSI_BUY_PENALTY_HIGH
+    return 0
+
+
+def rsi_sell_score_penalty(rsi_value: float) -> int:
+    """Extra SELL AI-score penalty for extended oversold."""
+    if rsi_value <= 20:
+        return RSI_SELL_PENALTY_STRONG
+    if rsi_value <= 30:
+        return RSI_SELL_PENALTY_SMALL
+    return 0
+
+
+def rsi_confidence_haircut(rsi_value: float, signal: str) -> float:
+    """Reduce displayed confidence when RSI is extended. Never hard-blocks."""
+    if rsi_value >= 85 or rsi_value <= 20:
+        return float(RSI_CONF_HAIRCUT_EXTREME)
+    if rsi_value >= 70:
+        return float(RSI_CONF_HAIRCUT_HIGH)
+    if signal == "SELL" and rsi_value <= 30:
+        return float(RSI_CONF_HAIRCUT_SELL_SOFT)
+    return 0.0
+
+
+def apply_rsi_position_cap(tier: str, size_pct: str, rsi_value: float) -> tuple[str, str]:
+    """
+    If RSI ≥ 85, never allow Full Size; max suggested size is 50%.
+    Soft risk classification — does not block the trade.
+    """
+    if rsi_value < 85:
+        return tier, size_pct
+    # Map any larger suggestion down to half size.
+    if size_pct in ("100%", "75%") or tier in ("Full Size", "Standard Size"):
+        return "Reduced Risk - Half Size", "50%"
+    return tier, size_pct
+
 
 def _empty_result(reason="Not enough candles"):
     return {
@@ -72,6 +141,9 @@ def _empty_result(reason="Not enough candles"):
         "liquidity_ok": False,
         "macd": {"macd": 0, "signal": 0, "trend": "-"},
         "rsi": 0,
+        "rsi_status": "✅ Normal",
+        "rsi_buy_penalty": 0,
+        "rsi_sell_penalty": 0,
         "pattern": "None",
         "liquidity_sweep": "NO",
         "bollinger": "None",
@@ -274,6 +346,13 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
         buy_score -= 8
         sell_score -= 8
 
+    # RSI risk model (soft): graduated score penalties — never hard-blocks.
+    # Applies identically to every asset that uses get_signal().
+    buy_rsi_pen = rsi_buy_score_penalty(rsi_value)
+    sell_rsi_pen = rsi_sell_score_penalty(rsi_value)
+    buy_score -= buy_rsi_pen
+    sell_score -= sell_rsi_pen
+
     # Scores are weighted to sum to 100 but bonuses (pattern +5, session +3)
     # can push them over - always cap at 100 (and floor at 0, since the
     # new low-liquidity penalty above can now push a very weak score negative).
@@ -416,6 +495,8 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
     active_confirmations = buy_confirmations if final_signal == "BUY" else \
         sell_confirmations if final_signal == "SELL" else max(buy_confirmations, sell_confirmations)
     confidence = min(confidence_from_confirmations(active_confirmations, ai_score), 100)
+    # Soft confidence haircut when RSI is extended (no hard block).
+    confidence = max(0.0, round(confidence - rsi_confidence_haircut(rsi_value, final_signal), 1))
 
     def position_sizing(confirmations):
         """
@@ -437,7 +518,13 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
             return "Reduced Risk - Quarter Size", "25%"
         return "Not Traded", "0%"
 
-    signal_tier, position_size_pct = position_sizing(active_confirmations) if final_signal != "NO TRADE" else ("-", "-")
+    if final_signal != "NO TRADE":
+        signal_tier, position_size_pct = position_sizing(active_confirmations)
+        signal_tier, position_size_pct = apply_rsi_position_cap(
+            signal_tier, position_size_pct, rsi_value
+        )
+    else:
+        signal_tier, position_size_pct = "-", "-"
 
     if ai_score >= 90:
         grade = "A+"
@@ -451,6 +538,14 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
         grade = "D"
 
     market_status = "Active" if session_active else "Low Liquidity"
+    rsi_status = rsi_status_label(rsi_value)
+
+    # Surface RSI risk in reasons when a trade is posted (informational).
+    if final_signal != "NO TRADE":
+        if buy_rsi_pen and final_signal == "BUY":
+            reasons.append(f"RSI risk penalty −{buy_rsi_pen} (overbought)")
+        elif sell_rsi_pen and final_signal == "SELL":
+            reasons.append(f"RSI risk penalty −{sell_rsi_pen} (oversold)")
 
     trade_levels = calculate_trade(
         final_signal, price, atr_value, decimals=decimals, session_active=session_active
@@ -483,6 +578,9 @@ def get_signal(close, high, low, timeframes, volume=None, open_=None, decimals=2
         "liquidity_ok": liquidity_ok,
         "macd": macd_value,
         "rsi": rsi_value,
+        "rsi_status": rsi_status,
+        "rsi_buy_penalty": buy_rsi_pen,
+        "rsi_sell_penalty": sell_rsi_pen,
         "pattern": pattern_name,
         "liquidity_sweep": smc["liquidity_side"] if smc["liquidity"] else "NO",
         "bollinger": bb_signal,

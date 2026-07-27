@@ -53,7 +53,7 @@ def format_signal(candles, result, decimals=2, label=None):
 
 📊 EMA : {_check(result.get('ema_ok'))}
 📊 MACD : {result['macd']['trend']}
-📊 RSI : {result['rsi']}
+📊 RSI : {result['rsi']} {result.get('rsi_status', '✅ Normal')}
 📊 ADX : {_check(result.get('adx_ok'))}
 📊 VWAP : {_check(result.get('vwap_ok'))}
 📊 Supertrend : {_check(result.get('supertrend_ok'))}
